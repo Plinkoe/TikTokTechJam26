@@ -79,6 +79,14 @@ def single_iteration(splits, params, logger):
                 batch_size=params.get("batch_size", 8192), patience=params.get("patience", 3),
                 history_len=params.get("history_len", 20), sequence_attention=True,
                 seed=params.get("seed", 0), verbose=True)
+        elif model_type == "history_multitask":
+            record["metrics"] = run_history_deepfm(
+                data_dir=params.get("data_dir", "./KuaiRand-Pure/data"),
+                epochs=params.get("epochs", 8), lr=params.get("lr", 1e-3),
+                emb_dim=params.get("emb_dim", 12), hidden=params.get("hidden", 96),
+                batch_size=params.get("batch_size", 8192), patience=params.get("patience", 3),
+                multitask_click=True, click_weight=params.get("click_weight", 0.25),
+                seed=params.get("seed", 0), verbose=True)
         elif model_type == "bpr":
             res = run_bpr(splits, k=params.get("k", 16), lr=params.get("lr", 0.001),
                            epochs=params.get("epochs", 40), l2=params.get("l2", 1e-6),
@@ -158,10 +166,16 @@ def main():
          "hidden": 96, "batch_size": 8192, "patience": 3,
          "hypothesis": "Causal user-history DeepFM with author/tag affinity and recency",
          "code_diff": "add causal train-history features + metadata DeepFM; validation only"},
-        {"model": "history_attention", "epochs": 8, "lr": 0.001, "emb_dim": 12,
-         "hidden": 96, "batch_size": 8192, "patience": 3, "history_len": 20,
-         "hypothesis": "Attend from candidate video to the user's recent positive history",
-         "code_diff": "add DIN-style candidate-to-recent-long-view attention"},
+        {"model": "history_multitask", "epochs": 8, "lr": 0.001, "emb_dim": 12,
+         "hidden": 96, "batch_size": 8192, "patience": 3, "click_weight": 0.25,
+         "hypothesis": "Use dense click feedback as an auxiliary representation-learning task",
+         "code_diff": "add shared-trunk click head with 0.25 auxiliary BCE weight"},
+ 
+        # {"model": "history_attention", "epochs": 8, "lr": 0.001, "emb_dim": 12,
+        #  "hidden": 96, "batch_size": 8192, "patience": 3, "history_len": 20,
+        #  "hypothesis": "Attend from candidate video to the user's recent positive history",
+        #  "code_diff": "add DIN-style candidate-to-recent-long-view attention"},
+         
     ]
 
     if LGB_AVAILABLE:

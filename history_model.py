@@ -37,6 +37,7 @@ class Row:
     duration: float
     upload_date: int
     label: int
+    click: int
 
 
 def _date_int(value):
@@ -83,7 +84,7 @@ def load_history_rows(data_dir):
                     video=r['video_id'], author=author, tag=tag, music=music,
                     video_type=video_type, tab=r['tab'],
                     duration=float(r['duration_ms']), upload_date=upload_date,
-                    label=int(r['long_view'] != '0'),
+                    label=int(r['long_view'] != '0'), click=int(r['is_click'] != '0'),
                 ))
     return out
 
@@ -143,6 +144,7 @@ def build_causal_features(rows_by_split, history_len=0):
         histories = (np.zeros((len(split_rows), history_len), dtype=np.int32)
                      if history_len else None)
         labels = np.empty(len(split_rows), dtype=np.float32)
+        clicks = np.empty(len(split_rows), dtype=np.float32)
         users = [None] * len(split_rows)
         # Sorting changes only the state-processing order; output stays aligned
         # with the loader/submission order.
@@ -175,6 +177,7 @@ def build_causal_features(rows_by_split, history_len=0):
                     np.log1p(ut[1]), np.log1p(since),
                 )
                 labels[i] = r.label
+                clicks[i] = r.click
                 users[i] = r.user
             if advance:
                 for i in group:
@@ -189,37 +192,42 @@ def build_causal_features(rows_by_split, history_len=0):
                         if history_len:
                             positive_history[r.user].append(cats[i, 1])
             cursor = end
-        return cats, dense, histories, labels, users
+        return cats, dense, histories, labels, clicks, users
 
     train_data = make(train, advance=True)
     valid_data = make(valid, advance=False)
     mean = train_data[1].mean(axis=0, keepdims=True)
     std = train_data[1].std(axis=0, keepdims=True)
     std[std < 1e-6] = 1.0
-    train_data = (train_data[0], (train_data[1] - mean) / std, train_data[2], train_data[3], train_data[4])
-    valid_data = (valid_data[0], (valid_data[1] - mean) / std, valid_data[2], valid_data[3], valid_data[4])
+    train_data = (train_data[0], (train_data[1] - mean) / std, train_data[2], train_data[3], train_data[4], train_data[5])
+    valid_data = (valid_data[0], (valid_data[1] - mean) / std, valid_data[2], valid_data[3], valid_data[4], valid_data[5])
     return train_data, valid_data, vocab_sizes, field_names
 
 
 class HistoryDeepFM(nn.Module):
-    def __init__(self, vocab_sizes, dense_dim, emb_dim=12, hidden=96, sequence_attention=False):
+    def __init__(self, vocab_sizes, dense_dim, emb_dim=12, hidden=96, sequence_attention=False,
+                 multitask_click=False):
         super().__init__()
         self.sequence_attention = sequence_attention
+        self.multitask_click = multitask_click
         self.linear = nn.ModuleList([nn.Embedding(n, 1) for n in vocab_sizes])
         self.embed = nn.ModuleList([nn.Embedding(n, emb_dim) for n in vocab_sizes])
         # The attention branch contributes a history context and its interaction
         # with the candidate-video embedding.  It is absent in the control.
         sequence_dim = 2 * emb_dim if sequence_attention else 0
         input_dim = len(vocab_sizes) * emb_dim + dense_dim + sequence_dim
-        self.deep = nn.Sequential(nn.Linear(input_dim, hidden), nn.ReLU(), nn.Dropout(0.1),
-                                  nn.Linear(hidden, hidden // 2), nn.ReLU(), nn.Linear(hidden // 2, 1))
+        # The click head shares this first hidden representation but not the
+        # long-view output layer, reducing negative transfer into the target.
+        self.deep_trunk = nn.Sequential(nn.Linear(input_dim, hidden), nn.ReLU(), nn.Dropout(0.1))
+        self.deep_out = nn.Sequential(nn.Linear(hidden, hidden // 2), nn.ReLU(), nn.Linear(hidden // 2, 1))
+        self.click_head = nn.Linear(hidden, 1) if multitask_click else None
         self.dense_linear = nn.Linear(dense_dim, 1)
         for layer in list(self.linear) + list(self.embed):
             nn.init.normal_(layer.weight, std=0.01)
             with torch.no_grad():
                 layer.weight[0].zero_()
 
-    def forward(self, cats, dense, history=None):
+    def forward(self, cats, dense, history=None, return_click=False):
         e = torch.stack([layer(cats[:, i]) for i, layer in enumerate(self.embed)], dim=1)
         summed = e.sum(dim=1)
         fm = 0.5 * ((summed * summed).sum(dim=1) - (e * e).sum(dim=(1, 2)))
@@ -239,8 +247,14 @@ class HistoryDeepFM(nn.Module):
             weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
             context = (weights.unsqueeze(-1) * keys).sum(dim=1)
             deep_input.extend([context, query * context])
-        deep = self.deep(torch.cat(deep_input, dim=1)).squeeze(1)
-        return linear + fm + self.dense_linear(dense).squeeze(1) + deep
+        trunk = self.deep_trunk(torch.cat(deep_input, dim=1))
+        deep = self.deep_out(trunk).squeeze(1)
+        long_view = linear + fm + self.dense_linear(dense).squeeze(1) + deep
+        if return_click:
+            if self.click_head is None:
+                raise ValueError('return_click=True requires multitask_click=True')
+            return long_view, self.click_head(trunk).squeeze(1)
+        return long_view
 
 
 def _predict(model, cats, dense, history, batch_size):
@@ -255,19 +269,22 @@ def _predict(model, cats, dense, history, batch_size):
 
 def run_history_deepfm(data_dir='./KuaiRand-Pure/data', epochs=8, lr=1e-3, emb_dim=12,
                        hidden=96, batch_size=8192, patience=3, seed=0, verbose=True,
-                       sequence_attention=False, history_len=20):
+                       sequence_attention=False, history_len=20, multitask_click=False,
+                       click_weight=0.25, validation_scores_path=None,
+                       checkpoint_path=None):
     """Train on train and return validation metrics only (never reads test rows)."""
     np.random.seed(seed)
     torch.manual_seed(seed)
     rows = load_history_rows(data_dir)
-    (tr_cat, tr_dense, tr_hist, tr_y, _), (va_cat, va_dense, va_hist, va_y, va_users), vocab_sizes, _ = \
+    (tr_cat, tr_dense, tr_hist, tr_y, tr_click, _), (va_cat, va_dense, va_hist, va_y, _, va_users), vocab_sizes, _ = \
         build_causal_features(rows, history_len=history_len if sequence_attention else 0)
     tr_cat = torch.from_numpy(tr_cat); tr_dense = torch.from_numpy(tr_dense); tr_y = torch.from_numpy(tr_y)
+    tr_click = torch.from_numpy(tr_click)
     va_cat = torch.from_numpy(va_cat); va_dense = torch.from_numpy(va_dense)
     tr_hist = torch.from_numpy(tr_hist) if tr_hist is not None else None
     va_hist = torch.from_numpy(va_hist) if va_hist is not None else None
     model = HistoryDeepFM(vocab_sizes, tr_dense.shape[1], emb_dim=emb_dim, hidden=hidden,
-                          sequence_attention=sequence_attention)
+                          sequence_attention=sequence_attention, multitask_click=multitask_click)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-6)
     best, best_state, bad = -1.0, None, 0
     rng = np.random.default_rng(seed)
@@ -278,8 +295,13 @@ def run_history_deepfm(data_dir='./KuaiRand-Pure/data', epochs=8, lr=1e-3, emb_d
         for start in range(0, len(order), batch_size):
             idx = torch.from_numpy(order[start:start + batch_size])
             h = tr_hist[idx] if tr_hist is not None else None
-            logits = model(tr_cat[idx], tr_dense[idx], h)
-            loss = F.binary_cross_entropy_with_logits(logits, tr_y[idx])
+            if multitask_click:
+                logits, click_logits = model(tr_cat[idx], tr_dense[idx], h, return_click=True)
+                loss = (F.binary_cross_entropy_with_logits(logits, tr_y[idx]) +
+                        click_weight * F.binary_cross_entropy_with_logits(click_logits, tr_click[idx]))
+            else:
+                logits = model(tr_cat[idx], tr_dense[idx], h)
+                loss = F.binary_cross_entropy_with_logits(logits, tr_y[idx])
             optimizer.zero_grad(); loss.backward(); optimizer.step()
             losses.append(float(loss.detach()))
         scores = _predict(model, va_cat, va_dense, va_hist, batch_size)
@@ -294,7 +316,25 @@ def run_history_deepfm(data_dir='./KuaiRand-Pure/data', epochs=8, lr=1e-3, emb_d
             if bad >= patience:
                 break
     model.load_state_dict(best_state)
-    return {'valid': evaluate(va_users, va_y, _predict(model, va_cat, va_dense, va_hist, batch_size))}
+    validation_scores = _predict(model, va_cat, va_dense, va_hist, batch_size)
+    if validation_scores_path:
+        # The order is exactly the development validation-log order.  Keep this
+        # lightweight artifact separate from labels so it is safe to share with
+        # blend/evaluation tools without introducing a new data source.
+        np.save(validation_scores_path, validation_scores)
+    if checkpoint_path:
+        torch.save({
+            'model_state': best_state,
+            'vocab_sizes': vocab_sizes,
+            'dense_dim': tr_dense.shape[1],
+            'emb_dim': emb_dim,
+            'hidden': hidden,
+            'sequence_attention': sequence_attention,
+            'multitask_click': multitask_click,
+            'history_len': history_len if sequence_attention else 0,
+            'seed': seed,
+        }, checkpoint_path)
+    return {'valid': evaluate(va_users, va_y, validation_scores)}
 
 
 if __name__ == '__main__':
@@ -310,6 +350,13 @@ if __name__ == '__main__':
     parser.add_argument('--sequence_attention', action='store_true',
                         help='attend from each candidate video to recent positive history')
     parser.add_argument('--history_len', type=int, default=20)
+    parser.add_argument('--multitask_click', action='store_true',
+                        help='train a shared-trunk click auxiliary head')
+    parser.add_argument('--click_weight', type=float, default=0.25)
+    parser.add_argument('--validation_scores_path',
+                        help='optional .npy path for validation scores in log row order')
+    parser.add_argument('--checkpoint_path',
+                        help='optional PyTorch checkpoint path for the best validation epoch')
     args = parser.parse_args()
     result = run_history_deepfm(**vars(args))
     m = result['valid']

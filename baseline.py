@@ -73,7 +73,7 @@ class FM:
         return np.concatenate([self.logits(X[i:i + bs])[0] for i in range(0, len(X), bs)])
 
 def run_fm(splits, k=16, lr=0.001, epochs=40, bs=8192, patience=4, seed=0,
-           verbose=True, evaluate_test=True):
+           verbose=True, evaluate_test=True, validation_scores_path=None):
     enc, dim = encode(splits)
     Xtr, ytr, _ = enc['train']; Xva, yva, uva = enc['valid']
     m = FM(dim, k=k, lr=lr, seed=seed)
@@ -95,7 +95,10 @@ def run_fm(splits, k=16, lr=0.001, epochs=40, bs=8192, patience=4, seed=0,
                 if verbose: print(f"  early stop at epoch {ep}")
                 break
     m.V, m.W, m.b = best_state
-    out = {'valid': evaluate(uva, yva, m.predict(Xva))}
+    validation_scores = m.predict(Xva)
+    if validation_scores_path:
+        np.save(validation_scores_path, validation_scores)
+    out = {'valid': evaluate(uva, yva, validation_scores)}
     # The autonomous search must not inspect test labels.  Keep this opt-in for
     # the standalone baseline command and final, one-time evaluation only.
     if evaluate_test:
@@ -112,13 +115,21 @@ if __name__ == '__main__':
     ap.add_argument('--lr', type=float, default=0.001)
     ap.add_argument('--epochs', type=int, default=40)
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--validation_scores_path',
+                    help='optional .npy path for validation scores in log row order')
+    ap.add_argument('--validation_only', action='store_true',
+                    help='do not evaluate test (required for development experiments)')
     a = ap.parse_args()
     print(f"loading {a.data_dir} ...")
     splits = load(a.data_dir)
     print({k_: len(v) for k_, v in splits.items()}, f"fields={FIELDS}")
     res = {'pop': run_pop, 'random': lambda s: run_random(s, a.seed),
-           'fm': lambda s: run_fm(s, k=a.k, lr=a.lr, epochs=a.epochs, seed=a.seed)}[a.model](splits)
+           'fm': lambda s: run_fm(s, k=a.k, lr=a.lr, epochs=a.epochs, seed=a.seed,
+                                  validation_scores_path=a.validation_scores_path,
+                                  evaluate_test=not a.validation_only)}[a.model](splits)
     print(f"\n=== {a.model} (seed={a.seed}) ===")
     for sp in ('valid', 'test'):
+        if sp not in res:
+            continue
         r = res[sp]
         print(f"  {sp:5s}  GAUC {r['GAUC']:.4f} | nDCG@5 {r['nDCG@5']:.4f} | primary {r['primary']:.4f}")

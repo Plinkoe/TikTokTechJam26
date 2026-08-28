@@ -27,6 +27,13 @@ Notes
   available PyTorch runtime and can be run with `python3 history_model.py --epochs 8`.
   It never loads test rows or uses validation labels as history features.
   The controlled sequence variant is `python3 history_model.py --sequence_attention --history_len 20`.
+  The multi-task variant is `python3 history_model.py --multitask_click --click_weight 0.25`; it
+  scores only the long-view head.
+  For a validation-only blend screen, export the two score arrays then run:
+  `python3 history_model.py --validation_scores_path run_logs/history_seed0.npy` and
+  `python3 baseline.py --model fm --validation_only --validation_scores_path run_logs/fm_seed0.npy`, followed by
+  `python3 blend_validation.py --champion run_logs/history_seed0.npy --fm run_logs/fm_seed0.npy`.
+  The blend tool rank-normalizes scores within each user and only loads the development validation split.
 
 # KuaiRand-Pure Starter Kit
 
