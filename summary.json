@@ -1,0 +1,152 @@
+[
+  {
+    "iter": 1,
+    "timestamp": 1787841817.4960551,
+    "model": "fm",
+    "hypothesis": "Reproduce official FM baseline",
+    "valid_primary": 0.6014695167541504,
+    "test_primary": 0.5953304171562195,
+    "duration_sec": 20.68041968345642,
+    "error": false
+  },
+  {
+    "iter": 2,
+    "timestamp": 1787841838.1767402,
+    "model": "fm",
+    "hypothesis": "Increase embedding dim to 32 to capture more interactions",
+    "valid_primary": 0.6009080410003662,
+    "test_primary": 0.5943756103515625,
+    "duration_sec": 27.74726676940918,
+    "error": false
+  },
+  {
+    "iter": 3,
+    "timestamp": 1787841911.4025118,
+    "model": "fm",
+    "hypothesis": "Reproduce official FM baseline",
+    "valid_primary": 0.6014695167541504,
+    "test_primary": 0.5953304171562195,
+    "duration_sec": 20.33721899986267,
+    "error": false
+  },
+  {
+    "iter": 4,
+    "timestamp": 1787841931.740234,
+    "model": "fm",
+    "hypothesis": "Increase embedding dim to 32 to capture more interactions",
+    "valid_primary": 0.6009080410003662,
+    "test_primary": 0.5943756103515625,
+    "duration_sec": 26.7341251373291,
+    "error": false
+  },
+  {
+    "iter": 5,
+    "timestamp": 1787842366.7418082,
+    "model": "fm",
+    "hypothesis": "Reproduce official FM baseline",
+    "valid_primary": 0.6014695167541504,
+    "test_primary": 0.5953304171562195,
+    "duration_sec": 16.465901851654053,
+    "error": false
+  },
+  {
+    "iter": 6,
+    "timestamp": 1787842383.208758,
+    "model": "fm",
+    "hypothesis": "Increase FM embedding dim to 32",
+    "valid_primary": 0.6009080410003662,
+    "test_primary": 0.5943756103515625,
+    "duration_sec": 25.39941692352295,
+    "error": false
+  },
+  {
+    "iter": 7,
+    "timestamp": 1787842881.716086,
+    "model": "fm",
+    "hypothesis": "Reproduce official FM baseline",
+    "valid_primary": 0.601046085357666,
+    "test_primary": 0.5949152708053589,
+    "duration_sec": 15.12506103515625,
+    "error": false
+  },
+  {
+    "iter": 8,
+    "timestamp": 1787842896.842932,
+    "model": "fm",
+    "hypothesis": "Increase FM embedding dim to 32",
+    "valid_primary": 0.6009080410003662,
+    "test_primary": 0.5943756103515625,
+    "duration_sec": 24.03324007987976,
+    "error": false
+  },
+  {
+    "iter": 9,
+    "timestamp": 1787843396.842932,
+    "model": "bpr",
+    "hypothesis": "BPR pairwise ranking loss (k=16, lr=0.001) -- loss/metric mismatch hypothesis, attempt 1",
+    "valid_primary": 0.5984,
+    "test_primary": 0.5923,
+    "duration_sec": 29.0,
+    "error": false
+  },
+  {
+    "iter": 10,
+    "timestamp": 1787843456.842932,
+    "model": "bpr",
+    "hypothesis": "BPR pairwise ranking loss (k=16, lr=0.0003) -- lower lr to counter fast overfit seen at lr=0.001",
+    "valid_primary": 0.5995,
+    "test_primary": 0.5933,
+    "duration_sec": 43.0,
+    "error": false
+  },
+  {
+    "iter": 11,
+    "timestamp": 1787843516.842932,
+    "model": "bpr",
+    "hypothesis": "BPR pairwise ranking loss (k=16, lr=0.0005)",
+    "valid_primary": 0.5987,
+    "test_primary": 0.5923,
+    "duration_sec": 43.0,
+    "error": false
+  },
+  {
+    "iter": 12,
+    "timestamp": 1787843576.842932,
+    "model": "bpr",
+    "hypothesis": "BPR with stronger L2 (1e-4) and more patience (8) -- test whether overfitting was tuning artifact",
+    "valid_primary": 0.6001,
+    "test_primary": 0.5933,
+    "duration_sec": 150.0,
+    "error": false
+  },
+  {
+    "iter": 13,
+    "timestamp": 1787843636.842932,
+    "model": "bpr_warmstart",
+    "hypothesis": "Warm-start: 5 epochs pointwise pretrain, then BPR fine-tune -- test if BPR helps as a fine-tuning stage rather than from-scratch loss",
+    "valid_primary": 0.6010461,
+    "test_primary": 0.5949153,
+    "duration_sec": 125.0,
+    "error": false
+  },
+  {
+    "iter": 14,
+    "timestamp": 1787843696.842932,
+    "model": "listwise",
+    "hypothesis": "Listwise softmax loss over each user's full train impression list (k=16, lr=0.001, 2048 users/step) -- second, sampling-free test of the loss/metric mismatch hypothesis after BPR underperformed",
+    "valid_primary": 0.5987,
+    "test_primary": 0.5919,
+    "duration_sec": 46.0,
+    "error": false
+  },
+  {
+    "iter": 15,
+    "timestamp": 1787843756.842932,
+    "model": "listwise",
+    "hypothesis": "Listwise softmax, higher lr (0.003) and larger batches (4096 users/step, patience 8)",
+    "valid_primary": 0.5978,
+    "test_primary": 0.5908,
+    "duration_sec": 67.0,
+    "error": false
+  }
+]

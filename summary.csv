@@ -1,0 +1,16 @@
+iter,timestamp,model,hypothesis,valid_primary,test_primary,duration_sec,error
+1,1787841817.4960551,fm,Reproduce official FM baseline,0.6014695167541504,0.5953304171562195,20.68041968345642,False
+2,1787841838.1767402,fm,Increase embedding dim to 32 to capture more interactions,0.6009080410003662,0.5943756103515625,27.74726676940918,False
+3,1787841911.4025118,fm,Reproduce official FM baseline,0.6014695167541504,0.5953304171562195,20.33721899986267,False
+4,1787841931.740234,fm,Increase embedding dim to 32 to capture more interactions,0.6009080410003662,0.5943756103515625,26.7341251373291,False
+5,1787842366.7418082,fm,Reproduce official FM baseline,0.6014695167541504,0.5953304171562195,16.465901851654053,False
+6,1787842383.208758,fm,Increase FM embedding dim to 32,0.6009080410003662,0.5943756103515625,25.39941692352295,False
+7,1787842881.716086,fm,Reproduce official FM baseline,0.601046085357666,0.5949152708053589,15.12506103515625,False
+8,1787842896.842932,fm,Increase FM embedding dim to 32,0.6009080410003662,0.5943756103515625,24.03324007987976,False
+9,1787843396.842932,bpr,"BPR pairwise ranking loss (k=16, lr=0.001) -- loss/metric mismatch hypothesis, attempt 1",0.5984,0.5923,29.0,False
+10,1787843456.842932,bpr,"BPR pairwise ranking loss (k=16, lr=0.0003) -- lower lr to counter fast overfit seen at lr=0.001",0.5995,0.5933,43.0,False
+11,1787843516.842932,bpr,"BPR pairwise ranking loss (k=16, lr=0.0005)",0.5987,0.5923,43.0,False
+12,1787843576.842932,bpr,BPR with stronger L2 (1e-4) and more patience (8) -- test whether overfitting was tuning artifact,0.6001,0.5933,150.0,False
+13,1787843636.842932,bpr_warmstart,"Warm-start: 5 epochs pointwise pretrain, then BPR fine-tune -- test if BPR helps as a fine-tuning stage rather than from-scratch loss",0.6010461,0.5949153,125.0,False
+14,1787843696.842932,listwise,"Listwise softmax loss over each user's full train impression list (k=16, lr=0.001, 2048 users/step) -- second, sampling-free test of the loss/metric mismatch hypothesis after BPR underperformed",0.5987,0.5919,46.0,False
+15,1787843756.842932,listwise,"Listwise softmax, higher lr (0.003) and larger batches (4096 users/step, patience 8)",0.5978,0.5908,67.0,False
