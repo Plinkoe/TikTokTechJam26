@@ -27,85 +27,89 @@ Notes
   available PyTorch runtime and can be run with `python3 history_model.py --epochs 8`.
   It never loads test rows or uses validation labels as history features.
   The controlled sequence variant is `python3 history_model.py --sequence_attention --history_len 20`.
+
 # KuaiRand-Pure Starter Kit
 
-## 依赖
+## Dependencies
 
-Python 3.9+ 和 numpy。**没有别的。** 不需要 torch、pandas、sklearn。
+Python 3.9+ and numpy. **Nothing else.** No need for torch, pandas, or sklearn.
 
-## 数据
+## Data
 
-从 https://kuairand.com 下载（Zenodo 直链，无需注册）：
+Download from https://kuairand.com (direct Zenodo link, no registration required):
 
 ```bash
-# 在 Starter Kit 目录下执行，解压后得到 ./KuaiRand-Pure/
+# Run from inside the Starter Kit directory; after extraction you'll get ./KuaiRand-Pure/
 wget https://zenodo.org/records/10439422/files/KuaiRand-Pure.tar.gz
 tar xzf KuaiRand-Pure.tar.gz
 ```
 
-## 运行
+## Running
 
 ```bash
 python3 baseline.py --model fm
 ```
 
-`--data_dir` 默认 `./KuaiRand-Pure/data`；数据放在别处时显式指定。
+`--data_dir` defaults to `./KuaiRand-Pure/data`; specify explicitly if the data lives elsewhere.
 
-`--model` 可选 `fm`（官方 baseline）/ `pop`（trivial baseline）/ `random`（下界，用于自检评测代码）。
-FM 全程约 40 秒（CPU，单核）。
+`--model` options are `fm` (official baseline) / `pop` (trivial baseline) / `random` (lower bound, used for self-checking the eval code).
+The FM run takes about 40 seconds total (CPU, single core).
 
-## 任务定义（口径已写死，不要改）
+## Task definition (the conventions below are fixed — do not change them)
 
 | | |
 |---|---|
-| 任务 | **用户内排序** —— 每个用户只对其在评测集中的曝光排序，不做全库检索 |
-| 相关性标签 | `long_view`（原生列，0/1） |
-| 指标 | `GAUC`、`nDCG@5`；**主分 = 两者平均** |
-| 数据划分 | train `20220408–20220421` / valid `20220422–20220428` / test `20220429–20220508` |
-| 零正例用户 | nDCG 记 0.0 并计入平均；GAUC 只统计 `0 < 正例数 < 曝光数` 的用户，按正例数加权 |
-| nDCG gain | `2^rel − 1`（二元标签下等价于 identity） |
+| Task | **Within-user ranking** — each user's exposures in the eval set are ranked against each other; this is not full-corpus retrieval |
+| Relevance label | `long_view` (native column, 0/1) |
+| Metrics | `GAUC`, `nDCG@5`; **primary score = average of the two** |
+| Data split | train `20220408–20220421` / valid `20220422–20220428` / test `20220429–20220508` |
+| Zero-positive users | nDCG is recorded as 0.0 and included in the average; GAUC only counts users with `0 < positive count < exposure count`, weighted by positive count |
+| nDCG gain | `2^rel − 1` (equivalent to identity under binary labels) |
 
-实现见 `evaluate.py`，全部约定写在文件头注释里。
+See `evaluate.py` for the implementation; all conventions are documented in the file's header comments.
 
-## Baseline 阶梯
+## Baseline ladder
 
-test 集上的分数。**要打败的是 FM 这一行。**
+Scores on the test set. **FM is the row to beat.**
 
 | | GAUC | nDCG@5 | primary |
 |---|---|---|---|
-| random（下界，自检用） | 0.4996 | 0.4511 | 0.4753 |
-| item popularity（trivial） | 0.6308 | 0.5121 | 0.5715 |
-| **FM（官方 baseline）** | **0.6610** | **0.5282** | **0.5946** |
+| random (lower bound, for self-checking) | 0.4996 | 0.4511 | 0.4753 |
+| item popularity (trivial) | 0.6308 | 0.5121 | 0.5715 |
+| **FM (official baseline)** | **0.6610** | **0.5282** | **0.5946** |
 
-### ⚠️ 指标的真实区间：nDCG@5 的天花板是 0.729，不是 1.0
+### ⚠️ The real range of the metrics: the ceiling for nDCG@5 is 0.729, not 1.0
 
-test 集 23,875 个用户里：
+Of the 23,875 users in the test set:
 
-| | 占比 | 对指标的影响 |
+| | Share | Effect on the metric |
 |---|---|---|
-| 全负用户（该用户所有曝光都不是 long_view） | **27.1%** | nDCG 恒为 **0**，任何模型都救不了；不计入 GAUC |
-| 全正用户 | **9.2%** | nDCG 恒为 **1**；不计入 GAUC |
-| 有区分度的用户 | **63.7%** | GAUC 的实际样本 |
+| All-negative users (none of that user's exposures are long_view) | **27.1%** | nDCG is always **0**; no model can fix this; not counted in GAUC |
+| All-positive users | **9.2%** | nDCG is always **1**; not counted in GAUC |
+| Users with discrimination (mixed) | **63.7%** | The actual sample GAUC is computed on |
 
-所以用真实标签当预测分（oracle，完美排序）也只能拿到：
+So even using the true labels as the predicted scores (oracle, perfect ranking) only achieves:
 
-| | random | FM baseline | **oracle 上限** | FM 已吃掉的区间 |
+| | random | FM baseline | **oracle ceiling** | Headroom already consumed by FM |
 |---|---|---|---|---|
 | GAUC | 0.4996 | 0.6610 | **1.0000** | 32.3% |
 | nDCG@5 | 0.4511 | 0.5282 | **0.7289** | 27.8% |
 | **primary** | 0.4753 | **0.5946** | **0.8645** | **30.7%** |
 
-**评估进展请以 oracle 为分母。** 看到 0.5946 就以为「离满分 1.0 还很远」是误判——
-baseline 已经吃掉可用区间的三成，剩余 headroom 是 0.27 而不是 0.41。
+**Measure progress against the oracle, not against 1.0.** Seeing 0.5946 and concluding "still far from
+a perfect score of 1.0" is a misjudgment — the baseline has already consumed about three-tenths of the
+achievable range; the remaining headroom is 0.27, not 0.41.
 
-FM 在 5 个随机种子上的 std 均为 **0.0008**。据此收敛判据取 **ε = 0.002（≈2.5σ）, N = 3**：
-连续 3 轮迭代 validation 主分提升不超过 0.002 即判定收敛。
+Across 5 random seeds, FM's std is **0.0008**. Based on this, the convergence criterion is set at
+**ε = 0.002 (≈2.5σ), N = 3**: if the validation primary score improves by no more than 0.002 over
+3 consecutive iterations, convergence is declared.
 
-> 自检：如果你的评测代码跑 `--model random` 得不到 primary ≈ 0.475（±0.001），说明 harness 有问题，先修它。
+> Self-check: if running your eval code with `--model random` does not give a primary score of
+> approximately 0.475 (±0.001), the harness has a bug — fix that first.
 
-## 提交格式
+## Submission format
 
-CSV，含表头，一行对应评测集的一行：
+CSV with a header row; one row per row in the eval set:
 
 ```
 row_id,user_id,video_id,score
@@ -114,99 +118,115 @@ row_id,user_id,video_id,score
 ...
 ```
 
-| 字段 | 说明 |
+| Field | Description |
 |---|---|
-| `row_id` | 0 起连续递增，对应 `data.load()[split]` 的行序（确定性：先读 `log_standard_4_08_to_4_21_pure.csv` 再读 `log_standard_4_22_to_5_08_pure.csv`，按 date 过滤后保持原文件顺序） |
-| `user_id` / `video_id` | 冗余字段，仅用于校验对齐 |
-| `score` | 你的模型给该行打的分，任意实数，只用相对大小；不允许 NaN / Inf |
+| `row_id` | Starts at 0, increments continuously, and corresponds to the row order from `data.load()[split]` (deterministic: `log_standard_4_08_to_4_21_pure.csv` is read first, then `log_standard_4_22_to_5_08_pure.csv`, filtered by date while preserving the original file order) |
+| `user_id` / `video_id` | Redundant fields, used only to validate alignment |
+| `score` | Your model's score for that row; any real number, only relative magnitude matters; NaN / Inf are not allowed |
 
-> **为什么必须带 `row_id`：** `(user_id, video_id)` 在评测集里**不唯一** ——
-> test 集有 3.06% 的重复对，最多重复 12 次。所以它不能作为主键。
+> **Why `row_id` is required:** `(user_id, video_id)` is **not unique** in the eval set —
+> 3.06% of pairs in the test set are duplicated, with up to 12 repeats. So it cannot serve as a primary key.
 
-生成与校验：
+Generating and validating:
 
 ```bash
-python3 submit.py --make  --split test  submission.csv    # 用官方 FM baseline 生成一份示例提交
-python3 submit.py --check --split test  submission.csv    # 校验格式与对齐
-python3 submit.py --score --split valid submission.csv    # 校验并打分（本地 valid 可用）
+python3 submit.py --make  --split test  submission.csv    # generate a sample submission using the official FM baseline
+python3 submit.py --check --split test  submission.csv    # validate format and alignment
+python3 submit.py --score --split valid submission.csv    # validate and score (local valid set only)
 ```
 
-`--check` 会拒绝：表头错误、行数不符、`row_id` 跳号、`user_id`/`video_id` 与评测集不对齐、
-`score` 非数字或为 NaN/Inf。**提交前请自行跑一遍 `--check`。**
+`--check` will reject: wrong header, incorrect row count, skipped `row_id` values, `user_id`/`video_id`
+misaligned with the eval set, or `score` that is non-numeric or NaN/Inf. **Run `--check` yourself before submitting.**
 
-## 从哪里开始改
+## Where to go from here
 
-下面的排序是**实测过的**，不是猜的。组委会已经试过的死路直接标出来，别重复踩。
+The ordering below is **based on actual experiments**, not guesses. Dead ends the committee has already
+tried are flagged directly — don't waste iterations repeating them.
 
-### 已实测：这三条没有收益，不要浪费迭代
+### Already tested: these three yielded no benefit — don't waste iterations on them
 
-| 试过的 | 结果 |
+| Tried | Result |
 |---|---|
-| **加静态特征** —— 把 CWM 的 13 个特征域全接进来（+`music_id`/`video_type`/`upload_type` + 6 个用户侧粗桶） | primary **0.5940** vs 5 域的 **0.5950**，噪声内无差别，甚至略降 |
-| **加模型容量** —— embedding 维度 k = 8 / 16 / 32 | 0.5895 / 0.5902 / 0.5887，几乎不动 |
-| **换损失函数** —— pairwise BPR（`bpr.py`，5 组配置含 warm-start）+ listwise softmax（`listwise.py`，2 组配置） | test primary 全部 ≤ 0.5949（baseline 0.5946），多数明显更差（0.5908–0.5933）；两种独立实现都不如原来的 pointwise logloss。详见下方说明 |
+| **Adding static features** — bringing in all 13 CWM feature domains (+`music_id`/`video_type`/`upload_type` + 6 coarse user-side buckets) | primary **0.5940** vs **0.5950** with 5 domains — no difference beyond noise, if anything slightly worse |
+| **Increasing model capacity** — embedding dimension k = 8 / 16 / 32 | 0.5895 / 0.5902 / 0.5887 — barely moves |
+| **Changing the loss function** — pairwise BPR (`bpr.py`, 5 configurations including warm-start) + listwise softmax (`listwise.py`, 2 configurations) | test primary all ≤ 0.5949 (baseline 0.5946), most noticeably worse (0.5908–0.5933); neither independent implementation beat the original pointwise logloss. See explanation below. |
 
-原因：`user_id × video_id` 的交叉已经吃掉了大部分可学的信号。`follow_user_num_range` 这类粗桶
-在 `user_id` 面前是冗余的；而 114 万行数据也撑不起更大的容量。**瓶颈不在特征和容量。**
+Reason: the `user_id × video_id` cross feature already captures most of the learnable signal. Coarse
+buckets like `follow_user_num_range` are redundant given `user_id`; and with only 1.14 million rows of
+data, there isn't enough data to support greater capacity. **The bottleneck is not features or capacity.**
 
-**关于"换损失函数"这条：** 这是我们最初判断最可能有效的方向，实测证伪了。BPR 从随机
-(pos, neg) 对采样训练，5 组配置（含"pointwise 预训练 + BPR 微调"的 warm-start 变体）里，
-微调阶段每一轮都在拉低 valid primary——最好的结果本质上就是预训练阶段的 pointwise 模型，
-BPR 微调没有净贡献。Listwise softmax（对每个用户的完整曝光列表做归一化，不采样、不引入
-采样噪声）同样没有帮助，且明显更差。两种独立实现方向一致地失败，可信度较高：`user_id ×
-video_id` 交叉已经把 (user, item) 的概率估计得很准，一个校准良好的 pointwise 模型本身就已
-经隐含了正确的组内排序；换成 pairwise/listwise 目标只是把一个低方差的 full-batch 梯度换成
-更嘈杂的估计，没有带来新信息。代码见 `bpr.py` / `listwise.py`，日志见 `run_logs/iterations.jsonl`
-iter 9–15。
+**On "changing the loss function":** this was our initial best guess for the most promising direction,
+and testing falsified it. BPR trains on randomly sampled (pos, neg) pairs; across 5 configurations
+(including a "pointwise pretrain + BPR fine-tune" warm-start variant), every fine-tuning round pulled
+the valid primary score down — the best result was essentially just the pretrained pointwise model, with
+BPR fine-tuning contributing nothing net. Listwise softmax (normalizing over each user's full exposure
+list, without sampling or the resulting sampling noise) likewise didn't help, and was noticeably worse.
+Both independent implementations failed in the same direction, which lends the finding some credibility:
+the `user_id × video_id` cross already estimates the (user, item) probability quite accurately, and a
+well-calibrated pointwise model already implicitly captures the correct within-group ranking; switching
+to a pairwise/listwise objective just swaps a low-variance full-batch gradient for a noisier estimate,
+without adding new information. Code is in `bpr.py` / `listwise.py`; logs are in `run_logs/iterations.jsonl`,
+iterations 9–15.
 
-⚠️ 另外注意：**纯用户侧特征的一阶项对分数贡献恒为 0。** 因为排序在用户内部做，任何在用户内为常数的项
-都不改变组内顺序（实测：`item_pop × 用户偏置` 和纯 `item_pop` 的分数一位不差）。用户侧特征只能通过
-**与物品侧的交叉项**起作用。
+⚠️ Also note: **the first-order term of a purely user-side feature always contributes 0 to the score.**
+Because ranking is done within each user, any term that is constant within a user does not change the
+within-group order (verified experimentally: `item_pop × user_bias` and plain `item_pop` produce identical
+scores to the last digit). User-side features can only have an effect through **cross terms with item-side
+features.**
 
-### 未探索：headroom 应该在这里
+### Unexplored: this is likely where the headroom is
 
-~~换损失函数~~ 已实测证伪，见上方表格。按我们更新后判断的可能性排序（**这几条还没测过**）：
+~~Changing the loss function~~ has been tested and falsified (see table above). Ranked by our updated
+assessment of likelihood (**none of the following have been tested yet**):
 
-1. **用户历史序列。** 现有特征**完全没用到行为序列**。KuaiRand 每用户在 train 里有上百到上千条交互，
-   DIN / SIM 那一类的兴趣建模是完全空白的方向。**现在优先级最高**——损失函数方向证伪后，
-   这是唯一一条直接给模型喂入新信息（而非重排现有信息）的方向。
-2. **多目标。** 日志里还有 `is_click`、`is_like`、`is_follow`、`is_comment`、`is_forward`、`play_time_ms`，
-   可以做多任务辅助 `long_view` 主任务。
-3. **观看时长的建模。** [CWM](https://github.com/hyz20/CWM) 的贡献正是这条：它把观看时长做**删失回归**
-   （视频播完时真实观看时长被截断，所以用单侧损失而非平方误差）。这是个有研究深度的方向。
-4. **换模型。** DeepFM / DCN / xDeepFM。鉴于容量实测不是瓶颈，**优先级放在 1-3 之后**。
-5. **时间特征与分布漂移。** `hourmin`、`date`，以及 train 与 test 之间的漂移。
-6. **无偏验证（进阶）。** `log_random_4_22_to_5_08_pure.csv` 是随机曝光日志（118 万行），
-   可作为额外的无偏验证集，检查模型是否只在有偏流量上过拟合。
+1. **User behavior history/sequences.** The current features **make no use of behavioral sequences at all**.
+   Each KuaiRand user has hundreds to thousands of interactions in train — the whole DIN/SIM family of
+   interest modeling is completely untouched. **Highest priority now** — with the loss-function direction
+   falsified, this is the only direction that feeds the model genuinely new information (rather than just
+   re-ranking existing information).
+2. **Multi-task learning.** The logs also contain `is_click`, `is_like`, `is_follow`, `is_comment`,
+   `is_forward`, `play_time_ms`, which could serve as auxiliary tasks alongside the main `long_view` task.
+3. **Modeling watch duration.** This is exactly [CWM](https://github.com/hyz20/CWM)'s contribution: it
+   treats watch duration as a **censored regression** problem (true watch time gets truncated when a
+   video finishes playing, so it uses a one-sided loss rather than squared error). A direction with real
+   research depth.
+4. **Switching models.** DeepFM / DCN / xDeepFM. Since capacity has been shown not to be the bottleneck,
+   **this is lower priority than 1–3.**
+5. **Temporal features and distribution shift.** `hourmin`, `date`, and the drift between train and test.
+6. **Unbiased validation (advanced).** `log_random_4_22_to_5_08_pure.csv` is a randomly-exposed log
+   (1.18 million rows) that can serve as an additional unbiased validation set, to check whether the model
+   is simply overfitting to biased traffic.
 
-## 用你自己的模型（包括 CWM）
+## Using your own model (including CWM)
 
-`evaluate.py` 与模型完全解耦，它只要三个等长数组：
+`evaluate.py` is fully decoupled from any particular model — it only needs three equal-length arrays:
 
 ```python
 from evaluate import evaluate
-print(evaluate(user_ids, labels, scores))   # scores 可以来自任何模型
+print(evaluate(user_ids, labels, scores))   # scores can come from any model
 ```
 
-- `user_ids`：评测集每一行的 user_id
-- `labels`：该行的 `long_view`（0/1）
-- `scores`：你的模型给该行打的分（任意实数，只用相对大小）
+- `user_ids`: the user_id for each row in the eval set
+- `labels`: that row's `long_view` (0/1)
+- `scores`: your model's score for that row (any real number, only relative magnitude matters)
 
-所以你可以完全不用 `baseline.py`，换成 PyTorch、LightGBM 或 [CWM](https://github.com/hyz20/CWM) 的 xDeepFM，
-只要最后把 `scores` 交给 `evaluate()` 即可。**评分口径由 `evaluate.py` 唯一决定。**
+So you don't have to use `baseline.py` at all — you can swap in PyTorch, LightGBM, or
+[CWM](https://github.com/hyz20/CWM)'s xDeepFM, and just hand the final `scores` to `evaluate()`.
+**The scoring convention is determined solely by `evaluate.py`.**
 
-> 用 CWM 需注意：它依赖 `torch==1.6.0`（2020 年版本，新 GPU 上大概装不上），
-> 且它的损失优化的是 counterfactual watch time、评测标签是自己重建的 `long_view2`。
-> 它是一篇时长纠偏论文的研究代码，可以当**进阶参考**，不建议作为起步点。
+> Note on using CWM: it depends on `torch==1.6.0` (a 2020-era version, likely won't install on newer
+> GPUs), and its loss optimizes counterfactual watch time, with the eval label being its own reconstructed
+> `long_view2`. It's the research code for a watch-time-debiasing paper — fine as an **advanced reference**,
+> not recommended as a starting point.
 
-## 文件
+## Files
 
 | | |
 |---|---|
-| `evaluate.py` | 指标实现 + 全部口径约定。**不要改。** |
-| `data.py` | 数据加载、官方划分、特征编码。加特征改这里。 |
-| `baseline.py` | 三个 baseline。FM 是要打败的那个。 |
-| `baseline_scores.json` | 官方发布的分数 + 种子方差 + 收敛参数。 |
-| `submit.py` | 生成 / 校验提交文件。 |
-| `ablation_features.py` | 特征消融实验，可复现「加特征没有收益」那组数字。 |
-| `history_model.py` | 因果历史特征 + DeepFM 实验；开发时只返回 validation 指标。 |
+| `evaluate.py` | Metric implementation + all scoring conventions. **Do not modify.** |
+| `data.py` | Data loading, official splits, feature encoding. Add features here. |
+| `baseline.py` | The three baselines. FM is the one to beat. |
+| `baseline_scores.json` | Officially published scores + seed variance + convergence parameters. |
+| `submit.py` | Generate / validate submission files. |
+| `ablation_features.py` | Feature ablation experiments; reproduces the "adding features gives no benefit" numbers. |
+| `history_model.py` | Causal history features + DeepFM experiment; returns validation metrics only during development. |
