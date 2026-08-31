@@ -1,11 +1,13 @@
-"""Legacy entry point for the autonomous KuaiRand agent.
+"""Entry point for the autonomous KuaiRand research agent.
 
-This wrapper delegates to the modular controller in agent_architecture.py so the
-repo keeps a single, tested implementation for baseline verification, experiment
-looping, and final submission generation.
+Set KUAI_LLM_CODE_MODE=true to let the LLM CREATE executable experiment modules
+instead of selecting only from the pre-written registry. The generated mode is
+validation-only during research and keeps the original controller as the fallback.
 """
+import os
 
 from agent_architecture import BenchmarkController, build_parser
+from autonomous_code_agent import AutonomousCodeAgent
 
 
 def main() -> None:
@@ -18,6 +20,17 @@ def main() -> None:
         patience=args.patience,
         seed=args.seed,
     )
+
+    code_mode = os.getenv("KUAI_LLM_CODE_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
+    if code_mode and controller.llm_planner.enabled:
+        result = AutonomousCodeAgent(controller, max_iters=args.max_iters).run()
+        print("\n=== autonomous LLM code-research agent ===")
+        print(f"baseline validation primary: {result['baseline_primary']:.6f}")
+        print(f"best generated validation primary: {result['best_validation_primary']:.6f}")
+        print(f"improved over baseline: {result['improved_over_baseline']}")
+        print(f"research log: {os.path.join(args.out_dir, 'iterations.jsonl')}")
+        return
+
     result = controller.run()
     submission_path = controller.finalize_submission(args.submission_path)
     print("\n=== autonomous research agent ===")
