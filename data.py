@@ -29,6 +29,30 @@ def load(data_dir):
         out[name] = [x for x in rows if lo <= x[0] <= hi]
     return out
 
+def load_unbiased_valid(data_dir):
+    """Second, unbiased validation slice from the randomly-exposed log
+    (log_random_4_22_to_5_08_pure.csv), restricted to the same date window as
+    the official validation split. Same tuple row shape as load()'s splits, so
+    it can be dropped into `splits['unbiased_valid']` before calling encode().
+    Deliberately never touches the test date window (see SPLITS['test']).
+    """
+    vid2author = {}
+    with open(os.path.join(data_dir, 'video_features_basic_pure.csv')) as fh:
+        for r in csv.DictReader(fh):
+            vid2author[r['video_id']] = r['author_id']
+    lo, hi = SPLITS['valid']
+    rows = []
+    with open(os.path.join(data_dir, 'log_random_4_22_to_5_08_pure.csv')) as fh:
+        for r in csv.DictReader(fh):
+            date = int(r['date'])
+            if not (lo <= date <= hi):
+                continue
+            rows.append((date, r['user_id'], r['video_id'],
+                         vid2author.get(r['video_id'], 'UNK'), r['tab'],
+                         float(r['duration_ms']), 1 if r[LABEL] != '0' else 0))
+    return rows
+
+
 def _bucket_edges(durations, n=10):
     return np.quantile(np.asarray(durations), np.linspace(0, 1, n + 1)[1:-1])
 

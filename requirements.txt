@@ -1,0 +1,10 @@
+# baseline.py / data.py / evaluate.py / submit.py: numpy only.
+numpy>=1.24
+
+# agent.py / agent_architecture.py / history_model.py: the causal-history
+# DeepFM and the autonomous agent loop require torch. Any CPU build works;
+# GPU is not required for this dataset size (~1.1M train rows).
+torch>=2.0
+
+# Optional: only needed if you enable the lgb proposal in models.py.
+# lightgbm>=4.0

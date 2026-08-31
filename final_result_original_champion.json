@@ -1,0 +1,23 @@
+{
+  "model": "history_deepfm (causal-history DeepFM, champion)",
+  "valid": {
+    "GAUC": 0.6715298891067505,
+    "nDCG@5": 0.5380234122276306,
+    "primary": 0.6047766208648682,
+    "users": 22377,
+    "rows": 124909
+  },
+  "test": {
+    "GAUC": 0.6523257671685846,
+    "nDCG@5": 0.5254876169643858,
+    "primary": 0.5889066920664852,
+    "users": 23875,
+    "rows": 170588
+  },
+  "official_fm_baseline_test": {
+    "GAUC": 0.661,
+    "nDCG@5": 0.5282,
+    "primary": 0.5946
+  },
+  "delta_test_primary": -0.005693307933514857
+}

@@ -1,0 +1,30 @@
+{
+  "model": "history_deepfm (champion_regularized)",
+  "params": {
+    "emb_dim": 12,
+    "hidden": 96,
+    "dropout": 0.3,
+    "weight_decay": 0.0001,
+    "seed": 0
+  },
+  "valid": {
+    "GAUC": 0.6709726452827454,
+    "nDCG@5": 0.5375522375106812,
+    "primary": 0.6042624711990356,
+    "users": 22377,
+    "rows": 124909
+  },
+  "test": {
+    "GAUC": 0.6553726380785734,
+    "nDCG@5": 0.5265052002986312,
+    "primary": 0.5909389191886023,
+    "users": 23875,
+    "rows": 170588
+  },
+  "official_fm_baseline_test": {
+    "GAUC": 0.661,
+    "nDCG@5": 0.5282,
+    "primary": 0.5946
+  },
+  "delta_test_primary": -0.00366108081139771
+}

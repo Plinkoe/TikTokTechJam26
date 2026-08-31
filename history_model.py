@@ -216,7 +216,7 @@ def build_causal_features(rows_by_split, history_len=0):
 
 class HistoryDeepFM(nn.Module):
     def __init__(self, vocab_sizes, dense_dim, emb_dim=12, hidden=96, sequence_attention=False,
-                 multitask_click=False, watch_time_aux=False):
+                 multitask_click=False, watch_time_aux=False, dropout=0.1):
         super().__init__()
         self.sequence_attention = sequence_attention
         self.multitask_click = multitask_click
@@ -229,7 +229,7 @@ class HistoryDeepFM(nn.Module):
         input_dim = len(vocab_sizes) * emb_dim + dense_dim + sequence_dim
         # The click head shares this first hidden representation but not the
         # long-view output layer, reducing negative transfer into the target.
-        self.deep_trunk = nn.Sequential(nn.Linear(input_dim, hidden), nn.ReLU(), nn.Dropout(0.1))
+        self.deep_trunk = nn.Sequential(nn.Linear(input_dim, hidden), nn.ReLU(), nn.Dropout(dropout))
         self.deep_out = nn.Sequential(nn.Linear(hidden, hidden // 2), nn.ReLU(), nn.Linear(hidden // 2, 1))
         self.click_head = nn.Linear(hidden, 1) if multitask_click else None
         # Sigmoid-bounded: the target (capped watch fraction) lives in [0, 1].
@@ -289,8 +289,16 @@ def run_history_deepfm(data_dir='./KuaiRand-Pure/data', epochs=8, lr=1e-3, emb_d
                        hidden=96, batch_size=8192, patience=3, seed=0, verbose=True,
                        sequence_attention=False, history_len=20, multitask_click=False,
                        click_weight=0.25, watch_time_aux=False, watch_weight=0.25,
-                       validation_scores_path=None, checkpoint_path=None):
-    """Train on train and return validation metrics only (never reads test rows)."""
+                       dropout=0.1, weight_decay=1e-6,
+                       validation_scores_path=None, checkpoint_path=None,
+                       extra_eval_rows=None):
+    """Train on train and return validation metrics only (never reads test rows).
+
+    extra_eval_rows: optional dict of {name: list[Row]} additional held-out sets
+    (e.g. an unbiased random-exposure slice) to score with the same trained model
+    and the same train-derived history state, without ever advancing state on
+    them and without touching test. Returned under result['extra'][name].
+    """
     np.random.seed(seed)
     torch.manual_seed(seed)
     rows = load_history_rows(data_dir)
@@ -305,8 +313,8 @@ def run_history_deepfm(data_dir='./KuaiRand-Pure/data', epochs=8, lr=1e-3, emb_d
     va_hist = torch.from_numpy(va_hist) if va_hist is not None else None
     model = HistoryDeepFM(vocab_sizes, tr_dense.shape[1], emb_dim=emb_dim, hidden=hidden,
                           sequence_attention=sequence_attention, multitask_click=multitask_click,
-                          watch_time_aux=watch_time_aux)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-6)
+                          watch_time_aux=watch_time_aux, dropout=dropout)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     best, best_state, bad = -1.0, None, 0
     rng = np.random.default_rng(seed)
     for epoch in range(1, epochs + 1):
@@ -350,6 +358,24 @@ def run_history_deepfm(data_dir='./KuaiRand-Pure/data', epochs=8, lr=1e-3, emb_d
                 break
     model.load_state_dict(best_state)
     validation_scores = _predict(model, va_cat, va_dense, va_hist, batch_size)
+    result = {'valid': evaluate(va_users, va_y, validation_scores)}
+    if extra_eval_rows:
+        # Score each extra held-out set with the SAME trained model and the SAME
+        # train-derived history/rate-counter state used for official valid —
+        # read-only, exactly like official valid: state is never advanced on
+        # these rows either. history_len=0 here matches the fact that these
+        # experiments don't use sequence_attention; if that changes, thread
+        # history_len through like the official valid path does.
+        result['extra'] = {}
+        for name, rows_extra in extra_eval_rows.items():
+            split = {'train': rows['train'], 'valid': rows_extra}
+            (_, (ex_cat, ex_dense, ex_hist, ex_y, _, _, _, ex_users), _, _) = build_causal_features(
+                split, history_len=history_len if sequence_attention else 0
+            )
+            ex_cat_t = torch.from_numpy(ex_cat); ex_dense_t = torch.from_numpy(ex_dense)
+            ex_hist_t = torch.from_numpy(ex_hist) if ex_hist is not None else None
+            ex_scores = _predict(model, ex_cat_t, ex_dense_t, ex_hist_t, batch_size)
+            result['extra'][name] = evaluate(ex_users, ex_y, ex_scores)
     if validation_scores_path:
         # The order is exactly the development validation-log order.  Keep this
         # lightweight artifact separate from labels so it is safe to share with
@@ -368,7 +394,7 @@ def run_history_deepfm(data_dir='./KuaiRand-Pure/data', epochs=8, lr=1e-3, emb_d
             'history_len': history_len if sequence_attention else 0,
             'seed': seed,
         }, checkpoint_path)
-    return {'valid': evaluate(va_users, va_y, validation_scores)}
+    return result
 
 
 if __name__ == '__main__':

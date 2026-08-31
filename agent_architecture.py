@@ -28,6 +28,7 @@ from features import build_tabular_features
 from history_model import HistoryDeepFM, build_causal_features, load_history_rows, run_history_deepfm
 from models import NumpyNNModel
 from submit import write_submission, read_submission
+from llm_planner import LLMPlanner, LLMPlannerConfig, ProposedExperiment, load_dotenv
 
 
 @dataclass
@@ -125,6 +126,8 @@ class HistoryDeepFMExperiment(BaseExperiment):
             "click_weight": 0.25,
             "watch_time_aux": False,
             "watch_weight": 0.25,
+            "dropout": 0.1,
+            "weight_decay": 1e-6,
         }
 
     def run(self, context: "BenchmarkContext", params: Optional[Dict[str, Any]] = None):
@@ -145,6 +148,8 @@ class HistoryDeepFMExperiment(BaseExperiment):
             click_weight=p.get("click_weight", 0.25),
             watch_time_aux=p.get("watch_time_aux", False),
             watch_weight=p.get("watch_weight", 0.25),
+            dropout=p.get("dropout", 0.1),
+            weight_decay=p.get("weight_decay", 1e-6),
         )
         return {"valid": result["valid"]}
 
@@ -152,7 +157,15 @@ class HistoryDeepFMExperiment(BaseExperiment):
         p = self.default_params(); p.update(params or {})
         rows = load_history_rows(context.data_dir)
         train = rows["train"] + rows["valid"]
-        test_rows = context.splits.get("test") or _read_test_rows(context.data_dir)
+        # NOTE: context.splits["test"] holds the tuple-encoded rows used by the
+        # plain FM/tabular pipeline (data.py:encode). build_causal_features needs
+        # the Row objects with .time_ms/.author/etc that _read_test_rows produces.
+        # `context.splits.get("test") or ...` used to short-circuit here because
+        # the tuple rows are truthy, silently feeding the wrong row type into
+        # build_causal_features and crashing with AttributeError — which
+        # finalize_submission() then swallowed and fell back to the FM baseline
+        # without telling anyone. Always use the Row-object loader here.
+        test_rows = _read_test_rows(context.data_dir)
         if not test_rows:
             raise RuntimeError("No test rows available in data_dir; cannot finalize submission.")
         split = {"train": train, "valid": test_rows}
@@ -177,8 +190,9 @@ class HistoryDeepFMExperiment(BaseExperiment):
             sequence_attention=p.get("sequence_attention", False),
             multitask_click=p.get("multitask_click", False),
             watch_time_aux=p.get("watch_time_aux", False),
+            dropout=p.get("dropout", 0.1),
         )
-        optimizer = torch.optim.AdamW(model.parameters(), lr=p["lr"], weight_decay=1e-6)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=p["lr"], weight_decay=p.get("weight_decay", 1e-6))
         rng = np.random.default_rng(p["seed"])
         for _ in range(p["epochs"]):
             model.train()
@@ -358,7 +372,7 @@ class ExperimentRegistry:
 
 
 class BenchmarkController:
-    def __init__(self, data_dir: str, out_dir: str = "run_logs", max_iters: int = 10, epsilon: float = 0.002, patience: int = 3, seed: int = 0):
+    def __init__(self, data_dir: str, out_dir: str = "run_logs", max_iters: int = 10, epsilon: float = 0.002, patience: int = 3, seed: int = 0, llm_config: Optional[LLMPlannerConfig] = None):
         self.data_dir = data_dir
         self.out_dir = out_dir
         self.max_iters = max_iters
@@ -374,6 +388,42 @@ class BenchmarkController:
         self.schedule = self.registry.default_schedule()
         self.tried = set()
         self.best_primary = -1.0
+        self.llm_planner = LLMPlanner(llm_config or LLMPlannerConfig.from_env())
+
+    def _maybe_llm_next_spec(self, previous_records: Iterable[Dict[str, Any]]) -> Optional[ExperimentSpec]:
+        if not self.llm_planner.enabled:
+            return None
+
+        proposal = self.llm_planner.suggest_next_experiment(self.registry, previous_records)
+        if proposal is None:
+            return None
+
+        if proposal.name not in self.registry._items:
+            return None
+
+        known = self.registry.get(proposal.name)
+        spec = ExperimentSpec(
+            name=proposal.name,
+            family=proposal.family or known.family,
+            params=dict(proposal.params),
+            hypothesis=proposal.hypothesis,
+            code_diff=proposal.code_diff,
+        )
+        if spec.name in {rec.get("experiment") for rec in previous_records if rec.get("experiment")}:
+            return None
+        return spec
+
+    def apply_epochs_override(self, epochs: Optional[int]) -> None:
+        """Cap every registered experiment's epoch budget for a quick smoke run.
+
+        Only touches specs that already declare an 'epochs' param, so it never
+        adds a meaningless field to experiments that don't train iteratively.
+        """
+        if epochs is None:
+            return
+        for spec in self.schedule:
+            if "epochs" in spec.params:
+                spec.params["epochs"] = epochs
 
     def baseline_gate(self) -> Dict[str, float]:
         with open(os.path.join(os.path.dirname(__file__), "baseline_scores.json"), "r", encoding="utf-8") as fh:
@@ -394,6 +444,11 @@ class BenchmarkController:
     def select_next_experiment(self, previous_records: Iterable[Dict[str, Any]]) -> Optional[ExperimentSpec]:
         previous = list(previous_records)
         seen = {rec.get("experiment") for rec in previous if rec.get("experiment")}
+
+        llm_choice = self._maybe_llm_next_spec(previous)
+        if llm_choice is not None:
+            return llm_choice
+
         valid_scores: Dict[str, List[float]] = {}
         for rec in previous:
             metrics = rec.get("metrics") or {}
@@ -500,8 +555,24 @@ class BenchmarkController:
                 full_path = os.path.join(self.out_dir, submission_path)
                 write_submission(full_path, self.splits["test"], scores)
                 read_submission(full_path, self.splits["test"])
+                if candidate != target:
+                    print(
+                        f"[finalize_submission] WARNING: best model '{target}' failed to "
+                        f"finalize; submission was generated with fallback '{candidate}' instead. "
+                        f"This means the shipped submission does NOT reflect the best validation "
+                        f"model. See traceback above."
+                    )
+                status_path = os.path.join(self.out_dir, "finalize_status.json")
+                with open(status_path, "w", encoding="utf-8") as fh:
+                    json.dump({
+                        "finalized_with": candidate,
+                        "requested_best_model": target,
+                        "fallback_used": candidate != target,
+                    }, fh, indent=2)
                 return full_path
             except Exception:
+                print(f"[finalize_submission] '{candidate}' failed to finalize:")
+                traceback.print_exc()
                 if candidate == "fm_baseline":
                     raise
         raise RuntimeError(f"No finalization path succeeded for target={target!r}")
@@ -553,9 +624,16 @@ def _blend_scores(users: List[str], champion: np.ndarray, fm: np.ndarray, weight
     return weight * champion_rank + (1.0 - weight) * fm_rank
 
 
-def _read_test_rows(data_dir: str) -> List[Any]:
+def _read_rows_from_log(data_dir: str, filename: str, lo: int, hi: int) -> List[Any]:
+    """Shared Row-object loader: read `filename`, keep rows with lo<=date<=hi,
+    and join video-side metadata. Used for both the official test slice and the
+    unbiased random-exposure validation slice below — same row shape either way,
+    so build_causal_features doesn't care which one it's scoring.
+    """
     import csv
-    path = os.path.join(data_dir, "log_standard_4_29_to_5_08_pure.csv")
+    from history_model import _date_int
+
+    path = os.path.join(data_dir, filename)
     if not os.path.exists(path):
         return []
     meta = {}
@@ -566,16 +644,19 @@ def _read_test_rows(data_dir: str) -> List[Any]:
                 row.get("tag", "UNK"),
                 row.get("music_id", "UNK"),
                 row.get("video_type", "UNK"),
-                0,
+                _date_int(row.get("upload_dt", "")),
             )
     rows = []
     with open(path, newline="") as fh:
         for row in csv.DictReader(fh):
+            date = int(row["date"])
+            if not (lo <= date <= hi):
+                continue
             author, tag, music, video_type, upload_date = meta.get(row["video_id"], ("UNK", "UNK", "UNK", "UNK", 0))
             rows.append(
                 type("Row", (), {
                     "time_ms": int(row["time_ms"]),
-                    "date": int(row["date"]),
+                    "date": date,
                     "hour": int(int(row["hourmin"]) // 100),
                     "user": row["user_id"],
                     "video": row["video_id"],
@@ -594,6 +675,42 @@ def _read_test_rows(data_dir: str) -> List[Any]:
     return rows
 
 
+def _read_test_rows(data_dir: str) -> List[Any]:
+    """Load the held-out test rows (2022-04-29..05-08) as Row objects.
+
+    NOTE: KuaiRand-Pure does NOT ship a separate `log_standard_4_29_to_5_08_pure.csv`
+    file. Valid (04-22..04-28) and test (04-29..05-08) both live inside
+    `log_standard_4_22_to_5_08_pure.csv` and must be split by date, exactly like
+    `data.py:load()` does. A previous version of this function pointed at a
+    nonexistent filename and silently returned [] (`if not os.path.exists: return []`),
+    which caused finalize() for history_deepfm to always raise, which
+    finalize_submission() then silently swallowed by falling back to the plain
+    FM baseline — so the shipped submission never actually reflected the champion
+    model. See SPLITS in data.py for the authoritative date ranges.
+    """
+    from data import SPLITS
+    lo, hi = SPLITS["test"]
+    return _read_rows_from_log(data_dir, "log_standard_4_22_to_5_08_pure.csv", lo, hi)
+
+
+def read_unbiased_valid_rows(data_dir: str) -> List[Any]:
+    """A second, unbiased validation slice from KuaiRand-Pure's randomly-exposed
+    log (`log_random_4_22_to_5_08_pure.csv`), restricted to the SAME date window
+    as the official (biased) validation split (2022-04-22..04-28).
+
+    Deliberately does not touch any date in the test window (04-29..05-08) —
+    this stays a validation-time tool, not a second peek at test. Its point is
+    that log_standard's validation rows come from KuaiRand's normal
+    recommender-exposed traffic (same selection bias as train), while
+    log_random's rows are randomly exposed — so a model that's overfitting to
+    exposure-correlated patterns in the biased validation split should show a
+    smaller (or negative) edge here, even though neither slice touches test.
+    """
+    from data import SPLITS
+    lo, hi = SPLITS["valid"]
+    return _read_rows_from_log(data_dir, "log_random_4_22_to_5_08_pure.csv", lo, hi)
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Autonomous ML research agent for KuaiRand-Pure")
     ap.add_argument("--data_dir", default="./KuaiRand-Pure/data")
@@ -603,11 +720,46 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--patience", type=int, default=3)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--submission_path", default="submission.csv")
+    ap.add_argument(
+        "--epochs", type=int, default=None,
+        help="Optional cap applied to every registered experiment's epoch budget "
+             "(e.g. for a quick smoke test). Leave unset to use each experiment's "
+             "own tuned default (FM=40 w/ patience, history_deepfm=8, etc).",
+    )
+    ap.add_argument(
+        "--llm_enabled",
+        action="store_true",
+        default=False,
+        help="Enable the optional JSON-based LLM planner. Requires KUAI_LLM_API_KEY or OPENAI_API_KEY.",
+    )
+    ap.add_argument(
+        "--llm_provider",
+        default=None,
+        help="LLM provider: openai, openrouter, azure. Defaults to env or openai.",
+    )
+    ap.add_argument(
+        "--llm_model",
+        default=None,
+        help="Model name for the LLM planner. Defaults to env or gpt-4o-mini.",
+    )
     return ap
 
 
 def main() -> None:
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
     args = build_parser().parse_args()
+    llm_config = LLMPlannerConfig.disabled()
+    if args.llm_enabled or os.getenv("KUAI_LLM_ENABLED", "").lower() in {"1", "true", "yes", "on"}:
+        llm_config = LLMPlannerConfig(
+            enabled=True,
+            provider=(args.llm_provider or os.getenv("KUAI_LLM_PROVIDER") or "openai").strip() or "openai",
+            model=(args.llm_model or os.getenv("KUAI_LLM_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini",
+            api_key=os.getenv("KUAI_LLM_API_KEY") or os.getenv("OPENAI_API_KEY"),
+            base_url=os.getenv("KUAI_LLM_BASE_URL") or None,
+            temperature=float(os.getenv("KUAI_LLM_TEMPERATURE", "0.2")),
+            max_tokens=int(os.getenv("KUAI_LLM_MAX_TOKENS", "300")),
+            system_prompt=os.getenv("KUAI_LLM_SYSTEM_PROMPT", "You are a disciplined ML research assistant for the KuaiRand benchmark. Return only valid JSON.")
+        )
     controller = BenchmarkController(
         data_dir=args.data_dir,
         out_dir=args.out_dir,
@@ -615,7 +767,9 @@ def main() -> None:
         epsilon=args.epsilon,
         patience=args.patience,
         seed=args.seed,
+        llm_config=llm_config,
     )
+    controller.apply_epochs_override(args.epochs)
     result = controller.run()
     submission_path = controller.finalize_submission(args.submission_path)
     print("\n=== autonomous research agent ===")
