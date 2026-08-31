@@ -1,0 +1,31 @@
+{
+  "timestamp": 1788148724.2242272,
+  "iteration": 2,
+  "experiment": "history_deepfm",
+  "family": "causal_history",
+  "hypothesis": "Causal user-history DeepFM can exploit user recency and item affinity signal.",
+  "code_diff": "training on causal user-history features with metadata DeepFM",
+  "params": {
+    "epochs": 8,
+    "lr": 0.001,
+    "emb_dim": 12,
+    "hidden": 96,
+    "batch_size": 8192,
+    "patience": 3,
+    "seed": 0,
+    "history_len": 20,
+    "data_dir": "./KuaiRand-Pure/data"
+  },
+  "metrics": {
+    "valid": {
+      "GAUC": 0.6714715361595154,
+      "nDCG@5": 0.5378406643867493,
+      "primary": 0.6046561002731323,
+      "users": 22377,
+      "rows": 124909
+    }
+  },
+  "error": null,
+  "status": "ok",
+  "primary": 0.6046561002731323
+}

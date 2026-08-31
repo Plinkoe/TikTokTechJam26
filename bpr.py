@@ -82,9 +82,10 @@ def bpr_step(m, Xpos, Xneg):
 
 
 def run_bpr(splits, k=16, lr=0.001, epochs=40, bs=8192, patience=4, seed=0,
-            steps_per_epoch=None, l2=1e-6, verbose=True):
+            steps_per_epoch=None, l2=1e-6, verbose=True, evaluate_test=False,
+            validation_scores_path=None):
     enc, dim = encode(splits)
-    Xtr, ytr, utr = enc['train']; Xva, yva, uva = enc['valid']; Xte, yte, ute = enc['test']
+    Xtr, ytr, utr = enc['train']; Xva, yva, uva = enc['valid']
     idx = build_pair_index(Xtr, ytr, utr)
     if verbose:
         print(f"  BPR: {idx['n_users']} users with both pos & neg rows in train "
@@ -113,8 +114,16 @@ def run_bpr(splits, k=16, lr=0.001, epochs=40, bs=8192, patience=4, seed=0,
                 if verbose: print(f"  early stop at epoch {ep}")
                 break
     m.V, m.W, m.b = best_state
-    return {'valid': evaluate(uva, yva, m.predict(Xva)),
-            'test':  evaluate(ute, yte, m.predict(Xte))}
+    validation_scores = m.predict(Xva)
+    if validation_scores_path:
+        np.save(validation_scores_path, validation_scores)
+    out = {'valid': evaluate(uva, yva, validation_scores)}
+    # Mirror baseline.run_fm: test stays opt-in only, never touched during
+    # iterative development or blend screening.
+    if evaluate_test:
+        Xte, yte, ute = enc['test']
+        out['test'] = evaluate(ute, yte, m.predict(Xte))
+    return out
 
 
 if __name__ == '__main__':
@@ -128,10 +137,16 @@ if __name__ == '__main__':
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--l2', type=float, default=1e-6)
     ap.add_argument('--patience', type=int, default=4)
+    ap.add_argument('--validation_scores_path',
+                    help='optional .npy path for validation scores in log row order')
+    ap.add_argument('--validation_only', action='store_true',
+                    help='do not evaluate test (required for development experiments)')
     a = ap.parse_args()
     splits = load(a.data_dir)
-    res = run_bpr(splits, k=a.k, lr=a.lr, epochs=a.epochs, seed=a.seed, l2=a.l2, patience=a.patience)
+    res = run_bpr(splits, k=a.k, lr=a.lr, epochs=a.epochs, seed=a.seed, l2=a.l2, patience=a.patience,
+                  evaluate_test=not a.validation_only, validation_scores_path=a.validation_scores_path)
     print(f"\n=== bpr (seed={a.seed}) ===")
     for sp in ('valid', 'test'):
-        r = res[sp]
-        print(f"  {sp:5s}  GAUC {r['GAUC']:.4f} | nDCG@5 {r['nDCG@5']:.4f} | primary {r['primary']:.4f}")
+        if sp in res:
+            r = res[sp]
+            print(f"  {sp:5s}  GAUC {r['GAUC']:.4f} | nDCG@5 {r['nDCG@5']:.4f} | primary {r['primary']:.4f}")

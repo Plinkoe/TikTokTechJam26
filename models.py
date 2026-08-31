@@ -34,11 +34,13 @@ class LightGBMModel:
     def fit(self, X, y, valid=None, num_round=100):
         dtrain = lgb.Dataset(X, label=y)
         evals = None
+        callbacks = []
         if valid is not None:
             Xv, yv = valid
             deval = lgb.Dataset(Xv, label=yv)
             evals = [deval]
-        self.bst = lgb.train(self.params, dtrain, num_boost_round=num_round, valid_sets=evals, verbose_eval=False)
+            callbacks.append(lgb.log_evaluation(period=0))  # replaces removed verbose_eval kwarg
+        self.bst = lgb.train(self.params, dtrain, num_boost_round=num_round, valid_sets=evals, callbacks=callbacks)
 
     def predict(self, X):
         return self.bst.predict(X)

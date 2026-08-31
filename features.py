@@ -12,7 +12,7 @@ def build_tabular_features(splits):
       - user_count, user_pos_rate
       - author_count, author_pos_rate
       - tab (one-hot with small vocabulary)
-      - dur_bucket (one-hot)
+      - dur_bucket (one-hot, quantile-bucketed into 10 bins from train durations)
     Returns dict with per-split arrays (X, y, users).
     """
     tr = splits['train']
@@ -23,28 +23,31 @@ def build_tabular_features(splits):
     author_cnt = collections.Counter()
     author_pos = collections.Counter()
     tabs = set()
-    dbs = set()
 
     for x in tr:
-        user = x[1]; vid = x[2]; author = x[3]; tab = x[4]; dur = int(x[5])
+        user = x[1]; vid = x[2]; author = x[3]; tab = x[4]
         label = x[6]
         item_cnt[vid] += 1; item_pos[vid] += label
         user_cnt[user] += 1; user_pos[user] += label
         author_cnt[author] += 1; author_pos[author] += label
         tabs.add(tab)
-        dbs.add(str(int(dur)))
+
+    # Quantile-bucket raw duration_ms into 10 bins (mirrors data.py's encode()).
+    # The previous version one-hotted the raw millisecond value directly, which
+    # has thousands of distinct values in train and blew up the feature matrix.
+    dur_edges = np.quantile(np.asarray([x[5] for x in tr], dtype=np.float32),
+                             np.linspace(0, 1, 11)[1:-1])
+    n_dur_buckets = len(dur_edges) + 1
 
     tab_list = sorted(list(tabs))
-    db_list = sorted(list(dbs))
     tab_idx = {v: i for i, v in enumerate(tab_list)}
-    db_idx = {v: i for i, v in enumerate(db_list)}
 
     def make_for(rws):
         X = []
         y = []
         users = []
         for x in rws:
-            user = x[1]; vid = x[2]; author = x[3]; tab = x[4]; dur = int(x[5])
+            user = x[1]; vid = x[2]; author = x[3]; tab = x[4]; dur = x[5]
             label = x[6]
             f = []
             # counts and rates (use log(1+cnt) and rate)
@@ -59,11 +62,9 @@ def build_tabular_features(splits):
             if tab in tab_idx:
                 tb[tab_idx[tab]] = 1.0
             f.extend(tb)
-            # dur bucket one-hot
-            db = [0.0] * len(db_list)
-            dbv = str(int(dur))
-            if dbv in db_idx:
-                db[db_idx[dbv]] = 1.0
+            # dur bucket one-hot (quantile bucket, not raw duration_ms)
+            db = [0.0] * n_dur_buckets
+            db[int(np.searchsorted(dur_edges, dur))] = 1.0
             f.extend(db)
             X.append(f); y.append(label); users.append(user)
         return np.asarray(X, dtype=np.float32), np.asarray(y, dtype=np.float32), users
