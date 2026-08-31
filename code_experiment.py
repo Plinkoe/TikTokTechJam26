@@ -1,9 +1,16 @@
-"""Runtime for LLM-generated validation experiments."""
+"""Runtime for LLM-generated validation experiments.
+
+Generated experiments run in an isolated subprocess. The subprocess receives a
+sandbox data directory containing ONLY training rows and the public validation
+window. The original benchmark directory is never exposed to generated code.
+"""
 from __future__ import annotations
 import ast
+import csv
 import json
 import os
 import py_compile
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -35,6 +42,32 @@ def validate_source(source: str) -> None:
         raise ValueError("Generated experiment must define run(train_csv, valid_csv, data_dir)")
 
 
+def _filter_csv(src: str, dst: str, lo: int, hi: int) -> None:
+    with open(src, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        rows = [r for r in reader if lo <= int(r["date"]) <= hi]
+        fields = reader.fieldnames
+    if not fields:
+        raise ValueError(f"No CSV header found: {src}")
+    with open(dst, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _make_safe_data_dir(data_dir: str, workspace: str) -> str:
+    safe = Path(workspace) / "data"
+    safe.mkdir()
+    shutil.copy2(os.path.join(data_dir, "video_features_basic_pure.csv"), safe / "video_features_basic_pure.csv")
+    # data.load() expects these exact filenames. The second file contains ONLY
+    # public validation dates, so its 'test' split is empty in the sandbox.
+    _filter_csv(os.path.join(data_dir, "log_standard_4_08_to_4_21_pure.csv"),
+                str(safe / "log_standard_4_08_to_4_21_pure.csv"), 20220408, 20220421)
+    _filter_csv(os.path.join(data_dir, "log_standard_4_22_to_5_08_pure.csv"),
+                str(safe / "log_standard_4_22_to_5_08_pure.csv"), 20220422, 20220428)
+    return str(safe)
+
+
 def write_candidate(source: str, workspace: str) -> str:
     validate_source(source)
     path = Path(workspace) / "experiment.py"
@@ -44,17 +77,16 @@ def write_candidate(source: str, workspace: str) -> str:
 
 
 def run_candidate(source: str, repo_dir: str, data_dir: str, timeout: int = 900) -> Dict[str, Any]:
-    """Validate and execute one generated experiment in an isolated subprocess."""
+    """Validate and execute one generated experiment with no hidden-test access."""
     with tempfile.TemporaryDirectory(prefix="kuai_generated_") as workspace:
         write_candidate(source, workspace)
-        train_csv = os.path.join(data_dir, "log_standard_4_08_to_4_21_pure.csv")
-        valid_csv = os.path.join(data_dir, "log_random_4_22_to_5_08_pure.csv")
+        safe_data = _make_safe_data_dir(data_dir, workspace)
         env = os.environ.copy()
         env.update({
             "KUAI_AGENT_MODE": "validation_only",
-            "KUAI_TRAIN_CSV": train_csv,
-            "KUAI_VALID_CSV": valid_csv,
-            "KUAI_DATA_DIR": data_dir,
+            "KUAI_TRAIN_CSV": os.path.join(safe_data, "log_standard_4_08_to_4_21_pure.csv"),
+            "KUAI_VALID_CSV": os.path.join(safe_data, "log_standard_4_22_to_5_08_pure.csv"),
+            "KUAI_DATA_DIR": safe_data,
             "PYTHONPATH": repo_dir + os.pathsep + env.get("PYTHONPATH", ""),
         })
         runner = ("import json, os, experiment; "
