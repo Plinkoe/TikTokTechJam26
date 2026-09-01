@@ -1,0 +1,37 @@
+{
+  "started_at": 1788237172.422749,
+  "finished_at": 1788237436.8732212,
+  "wall_clock_sec": 264.45047211647034,
+  "iterations": 3,
+  "max_iterations": 8,
+  "stop_reason": "converged",
+  "convergence_rule": {
+    "epsilon": 0.002,
+    "N": 3
+  },
+  "manual_interventions": 0,
+  "manual_interventions_definition": "No human changes or recovery actions during this unattended agent run.",
+  "best_model": "fm_baseline",
+  "best_validation": {
+    "GAUC": 0.6671333909034729,
+    "nDCG@5": 0.5358057022094727,
+    "primary": 0.6014695167541504,
+    "users": 22377,
+    "rows": 124909
+  },
+  "official_baseline_valid": {
+    "GAUC": 0.6674,
+    "nDCG@5": 0.5357,
+    "primary": 0.6016
+  },
+  "primary_delta_vs_official_baseline": -0.000130483245849633,
+  "beat_official_baseline": false,
+  "stages_explored": {
+    "llm_code": 1,
+    "llm_train": 1,
+    "fm": 1
+  },
+  "blocked_experiments": {},
+  "llm_enabled": true,
+  "llm_model": "openai/gpt-4o-mini"
+}

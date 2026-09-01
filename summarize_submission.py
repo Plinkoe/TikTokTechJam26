@@ -36,9 +36,22 @@ def main() -> None:
             if line.strip():
                 calls.append(json.loads(line))
 
-    input_tokens = sum(int(c.get("usage", {}).get("prompt_tokens", c.get("usage", {}).get("input_tokens", 0)) or 0) for c in calls)
-    output_tokens = sum(int(c.get("usage", {}).get("completion_tokens", c.get("usage", {}).get("output_tokens", 0)) or 0) for c in calls)
-    total_tokens = sum(int(c.get("usage", {}).get("total_tokens", 0) or 0) for c in calls)
+    # llm_calls.jsonl holds two record kinds: one "provider_call" per HTTP
+    # request, and one "planner_result" summary per planner invocation that
+    # echoes the last call's usage. Counting both double-reports the tokens.
+    # Records written before that split have no "kind" and are counted.
+    billable = [c for c in calls if c.get("kind", "provider_call") == "provider_call"]
+    planner_invocations = sum(1 for c in calls if c.get("kind") == "planner_result")
+
+    def usage_sum(key, alt):
+        return sum(int((c.get("usage") or {}).get(key, (c.get("usage") or {}).get(alt, 0)) or 0)
+                   for c in billable)
+
+    input_tokens = usage_sum("prompt_tokens", "input_tokens")
+    output_tokens = usage_sum("completion_tokens", "output_tokens")
+    total_tokens = sum(int((c.get("usage") or {}).get("total_tokens", 0) or 0) for c in billable)
+    reported_cost = sum(float((c.get("usage") or {}).get("cost", 0) or 0) for c in billable)
+    failed_calls = sum(1 for c in billable if c.get("success") is False)
 
     result = {
         "iterations": metadata.get("iterations"),
@@ -46,12 +59,20 @@ def main() -> None:
         "manual_interventions": metadata.get("manual_interventions"),
         "wall_clock_sec": metadata.get("wall_clock_sec"),
         "llm_enabled": metadata.get("llm_enabled", False),
-        "llm_calls": len(calls),
+        "stop_reason": metadata.get("stop_reason"),
+        "llm_provider_calls": len(billable),
+        "llm_failed_calls": failed_calls,
+        "llm_planner_invocations": planner_invocations,
         "llm_input_tokens": input_tokens,
         "llm_output_tokens": output_tokens,
         "llm_total_tokens": total_tokens,
+        "llm_reported_cost_usd": round(reported_cost, 6),
+        "llm_model": metadata.get("llm_model"),
+        "gpu_hours": 0.0,
+        "gpu_note": "CPU-only run; no GPU was used at any stage.",
+        "primary_delta_vs_official_baseline": metadata.get("primary_delta_vs_official_baseline"),
         "final_result": final_result,
-        "note": "Token values are provider-reported usage from llm_calls.jsonl; missing telemetry is not inferred.",
+        "note": "Token values are provider-reported usage from llm_calls.jsonl, counting one record per HTTP call; missing telemetry is not inferred.",
     }
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
