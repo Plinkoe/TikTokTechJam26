@@ -142,4 +142,4 @@ Each iteration should contain:
 
 - **Sean Hoe / repository owner:** agent architecture, benchmark integration, experiment implementation, LLM-code generation path, validation/reproducibility tooling and submission packaging.
 
-If the project has additional team members, replace this section with the agreed contribution breakdown before submitting to Devpost.
+

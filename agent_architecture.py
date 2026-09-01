@@ -26,7 +26,9 @@ from data import load, encode
 from evaluate import evaluate
 from features import build_tabular_features
 from history_model import HistoryDeepFM, build_causal_features, load_history_rows, run_history_deepfm
-from llm_model_experiment import CandidateCodeError, compile_candidate_model, train_and_eval_candidate
+from llm_model_experiment import (CandidateCodeError, compile_candidate_model,
+                                  compile_feature_transform, train_and_eval_candidate,
+                                  _apply_feature_transform, DEFAULT_CANDIDATE_CODE)
 from models import NumpyNNModel
 from submit import write_submission, read_submission
 from llm_planner import LLMPlanner, LLMPlannerConfig, ProposedExperiment, load_dotenv
@@ -264,23 +266,28 @@ class LLMCodeExperiment(BaseExperiment):
             "epochs": 6, "lr": 1e-3, "emb_dim": 12, "hidden": 96,
             "dropout": 0.1, "weight_decay": 1e-6, "seed": 0,
             "history_len": 0, "batch_size": 8192, "patience": 3,
-            "code": "",
+            "code": "", "feature_code": "",
+            "loss": "bce", "scheduler": "none", "grad_clip": 0.0,
         }
 
     def run(self, context: "BenchmarkContext", params: Optional[Dict[str, Any]] = None):
         p = self.default_params(); p.update(params or {})
         code = (p.pop("code", "") or "").strip()
+        feature_code = (p.pop("feature_code", "") or "").strip()
         if not code:
             raise CandidateCodeError("llm_generated experiment requires a non-empty params['code']")
         model_cls = compile_candidate_model(code)
-        return train_and_eval_candidate(model_cls, context.data_dir, hyperparams=p)
+        return train_and_eval_candidate(model_cls, context.data_dir, hyperparams=p,
+                                        feature_code=feature_code or None)
 
     def finalize(self, context: "BenchmarkContext", params: Optional[Dict[str, Any]] = None):
         p = self.default_params(); p.update(params or {})
         code = (p.pop("code", "") or "").strip()
+        feature_code = (p.pop("feature_code", "") or "").strip()
         if not code:
             raise CandidateCodeError("llm_generated experiment requires params['code'] to finalize")
         model_cls = compile_candidate_model(code)
+        transform = compile_feature_transform(feature_code) if feature_code else None
 
         rows = load_history_rows(context.data_dir)
         train = rows["train"] + rows["valid"]
@@ -290,6 +297,9 @@ class LLMCodeExperiment(BaseExperiment):
         split = {"train": train, "valid": test_rows}
         (tr_cat, tr_dense, tr_hist, tr_y, *_), (va_cat, va_dense, va_hist, va_y, *_, va_users), \
             vocab_sizes, _ = build_causal_features(split, history_len=p.get("history_len", 0))
+
+        tr_dense = _apply_feature_transform(transform, tr_cat, np.asarray(tr_dense, dtype=np.float32))
+        va_dense = _apply_feature_transform(transform, va_cat, np.asarray(va_dense, dtype=np.float32))
 
         tr_cat = torch.from_numpy(np.asarray(tr_cat, dtype=np.int64))
         tr_dense = torch.from_numpy(np.asarray(tr_dense, dtype=np.float32))
@@ -398,6 +408,13 @@ class RunLogger:
             fh.write(json.dumps(_sanitize(record), ensure_ascii=False) + "\n")
 
 
+# Spec 2.3: 50 iterations per benchmark run is a hard cap, with a 6h
+# wall-clock backstop. The convergence rule (eps=0.002, N=3) normally fires
+# first; these exist so a pathological run cannot spin forever.
+MAX_ITERATIONS_HARD_CAP = 50
+WALL_CLOCK_LIMIT_SEC = 6 * 60 * 60
+
+
 class ExperimentRegistry:
     def __init__(self):
         self._items: Dict[str, BaseExperiment] = {}
@@ -449,10 +466,9 @@ class ExperimentRegistry:
 
 
 class BenchmarkController:
-    def __init__(self, data_dir: str, out_dir: str = "run_logs", max_iters: int = 10, epsilon: float = 0.002, patience: int = 3, seed: int = 0, llm_config: Optional[LLMPlannerConfig] = None):
+    def __init__(self, data_dir: str, out_dir: str = "run_logs", max_iters: int = 10, epsilon: float = 0.002, patience: int = 3, seed: int = 0, llm_config: Optional[LLMPlannerConfig] = None, wall_clock_limit: float = WALL_CLOCK_LIMIT_SEC):
         self.data_dir = data_dir
         self.out_dir = out_dir
-        self.max_iters = max_iters
         self.epsilon = epsilon
         self.patience = patience
         self.seed = seed
@@ -462,10 +478,24 @@ class BenchmarkController:
         for model in [FMExperiment(), HistoryDeepFMExperiment(), MultitaskDeepFMExperiment(), TabularExperiment(), BlendExperiment(), LLMCodeExperiment()]:
             self.registry.register(model)
         self.context = BenchmarkContext(data_dir=data_dir, out_dir=out_dir, splits=self.splits, seed=seed, max_iters=max_iters, epsilon=epsilon, patience=patience)
+        if max_iters > MAX_ITERATIONS_HARD_CAP:
+            print(f"[budget] --max_iters {max_iters} exceeds the {MAX_ITERATIONS_HARD_CAP}-iteration "
+                  f"cap; clamping.")
+        self.max_iters = min(max_iters, MAX_ITERATIONS_HARD_CAP)
+        self.wall_clock_limit = float(wall_clock_limit)
+        self.run_started_at: Optional[float] = None
+        self.stop_reason: str = "not_started"
+        # Signatures of experiments whose failure is deterministic, so the run
+        # does not spend its budget re-deriving the same traceback.
+        self.blocked: Dict[str, str] = {}
         self.schedule = self.registry.default_schedule()
         self.tried = set()
         self.best_primary = -1.0
         self.llm_planner = LLMPlanner(llm_config or LLMPlannerConfig.from_env())
+        # Reject unusable generated code at proposal time (sandbox token check +
+        # dry-run forward pass), so the planner can self-correct within one turn.
+        self.llm_planner.code_validator = compile_candidate_model
+        self.llm_planner.feature_validator = compile_feature_transform
 
     def _resolve_experiment(self, name: str) -> BaseExperiment:
         """Look up an experiment by record name.
@@ -478,9 +508,44 @@ class BenchmarkController:
         """
         if name in self.registry._items:
             return self.registry.get(name)
-        if name.startswith("llm_generated"):
+        if name.startswith(("llm_generated", "llm_features", "llm_train")):
             return self.registry.get("llm_generated")
         raise KeyError(name)
+
+    def _record_planner_failure(self, reason: str) -> None:
+        """Make a planner failure visible instead of silently rescheduling.
+
+        Before this, a failed LLM call left NO trace in iterations.jsonl: the
+        controller just fell through to schedule[0] and the run printed
+        "best validation model: fm_baseline" as if nothing had gone wrong.
+        """
+        planner = self.llm_planner
+        record = {
+            "timestamp": time.time(),
+            "iteration": self.context.iteration_count,
+            "experiment": "llm_planner",
+            "family": "planner",
+            "hypothesis": "LLM planner proposal",
+            "code_diff": "",
+            "params": {
+                "provider": planner.config.provider,
+                "model": planner.config.model,
+                "force_code": planner.config.force_code,
+                "max_tokens": planner.config.max_tokens,
+            },
+            "metrics": None,
+            "error": reason,
+            "status": "planner_failed",
+            "finish_reason": getattr(planner, "last_finish_reason", None),
+            "raw_response": (getattr(planner, "last_raw_content", "") or "")[:2000],
+        }
+        self.logger.write(record)
+        if planner.config.force_code:
+            raise RuntimeError(
+                "LLM planner failed while KUAI_LLM_FORCE_CODE=true: " + str(reason) +
+                " -- refusing to fall back to the fixed schedule. "
+                "See run_logs/llm_calls.jsonl for the raw provider response."
+            )
 
     def _maybe_llm_next_spec(self, previous_records: Iterable[Dict[str, Any]]) -> Optional[ExperimentSpec]:
         if not self.llm_planner.enabled:
@@ -488,6 +553,7 @@ class BenchmarkController:
 
         proposal = self.llm_planner.suggest_next_experiment(self.registry, previous_records)
         if proposal is None:
+            self._record_planner_failure(self.llm_planner.last_error or "planner returned no proposal")
             return None
 
         # Code-mode: the LLM wrote a new CandidateModel architecture rather
@@ -495,12 +561,45 @@ class BenchmarkController:
         # proposal gets its own record name so it always runs (no dedup
         # against a fixed registry name) and shows up as its own line in
         # iterations.jsonl/results, distinct from earlier candidates.
+        mode = getattr(proposal, "mode", "tune")
         code = (getattr(proposal, "code", "") or "").strip()
-        if proposal.family == "llm_code" or code:
-            if not code:
+        feature_code = (getattr(proposal, "feature_code", "") or "").strip()
+        n = len(list(previous_records))
+
+        # Feature- and training-stage proposals run against a fixed reference
+        # architecture: if the model changed at the same time, the resulting
+        # delta could not be attributed to the stage under test.
+        if mode == "features":
+            if not feature_code:
+                self._record_planner_failure("mode='features' proposal carried no feature_code")
                 return None
             return ExperimentSpec(
-                name=f"llm_generated_{len(list(previous_records))}",
+                name=f"llm_features_{n}",
+                family="llm_features",
+                params={**dict(proposal.params), "code": code or DEFAULT_CANDIDATE_CODE,
+                        "feature_code": feature_code},
+                hypothesis=proposal.hypothesis,
+                code_diff=feature_code,
+            )
+
+        if mode == "train":
+            if not proposal.params:
+                self._record_planner_failure("mode='train' proposal carried no params")
+                return None
+            return ExperimentSpec(
+                name=f"llm_train_{n}",
+                family="llm_train",
+                params={**dict(proposal.params), "code": code or DEFAULT_CANDIDATE_CODE},
+                hypothesis=proposal.hypothesis,
+                code_diff=json.dumps(dict(proposal.params), sort_keys=True)[:2000],
+            )
+
+        if mode == "code" or proposal.family == "llm_code" or code:
+            if not code:
+                self._record_planner_failure("proposal claimed family='llm_code' but carried no code")
+                return None
+            return ExperimentSpec(
+                name=f"llm_generated_{n}",
                 family="llm_code",
                 params={**dict(proposal.params), "code": code},
                 hypothesis=proposal.hypothesis,
@@ -508,6 +607,7 @@ class BenchmarkController:
             )
 
         if proposal.name not in self.registry._items:
+            self._record_planner_failure(f"proposal named unknown experiment {proposal.name!r}")
             return None
 
         known = self.registry.get(proposal.name)
@@ -573,12 +673,18 @@ class BenchmarkController:
         ]
         for family in ranked_families + [spec.family for spec in self.schedule]:
             for spec in self.schedule:
-                if spec.family == family and spec.name not in seen:
+                if spec.family == family and spec.name not in seen and spec.name not in self.blocked:
                     return spec
         for spec in self.schedule:
-            if spec.name not in seen:
+            if spec.name not in seen and spec.name not in self.blocked:
                 return spec
         return None
+
+    # Errors that are a property of the proposal itself. Re-running the exact
+    # same spec cannot change the outcome, so one attempt is the honest budget;
+    # the error text goes to the planner, which routes around it next turn.
+    _DETERMINISTIC_ERRORS = (CandidateCodeError, KeyError, TypeError, AttributeError,
+                             NameError, IndexError, ValueError)
 
     def _run_single_experiment(self, spec: ExperimentSpec, retries: int = 2) -> Dict[str, Any]:
         experiment = self._resolve_experiment(spec.name)
@@ -611,16 +717,34 @@ class BenchmarkController:
                         self._save_checkpoint(record)
                 self.logger.write(record)
                 return record
-            except Exception:
+            except Exception as exc:
                 record["status"] = "failed"
                 record["error"] = traceback.format_exc()
+                record["error_type"] = type(exc).__name__
+                deterministic = isinstance(exc, self._DETERMINISTIC_ERRORS)
+                record["retryable"] = not deterministic
                 self.logger.write(record)
+                if deterministic:
+                    # Remember it so the fixed schedule does not re-offer the
+                    # same broken spec, and so the planner sees it in history.
+                    self.blocked[spec.name] = f"{type(exc).__name__}: {exc}"
+                    return record
                 if attempt < retries:
+                    time.sleep(min(2 ** attempt, 8))  # transient: back off, then retry
                     continue
                 return record
         return {"experiment": spec.name, "status": "failed", "error": "unreachable"}
 
+    def _next_scheduled_spec(self, previous_records: Iterable[Dict[str, Any]]) -> Optional[ExperimentSpec]:
+        """The fixed schedule, ignoring the planner. Used as the recovery path."""
+        seen = {rec.get("experiment") for rec in previous_records if rec.get("experiment")}
+        for spec in self.schedule:
+            if spec.name not in seen and spec.name not in self.blocked:
+                return spec
+        return None
+
     def run(self) -> Dict[str, Any]:
+        self.run_started_at = time.time()
         baseline_metrics = self.baseline_gate()
         self.context.best_metrics = baseline_metrics
         self.context.best_model_name = "fm_baseline"
@@ -630,9 +754,25 @@ class BenchmarkController:
 
         previous_records: List[Dict[str, Any]] = []
         stagnation = 0
+        self.stop_reason = "max_iterations"
         while self.context.iteration_count < self.max_iters:
-            next_spec = self.select_next_experiment(previous_records)
+            elapsed = time.time() - self.run_started_at
+            if elapsed >= self.wall_clock_limit:
+                self.stop_reason = "wall_clock_limit"
+                print(f"[budget] wall-clock limit reached after {elapsed / 3600:.2f}h; stopping.")
+                break
+            try:
+                next_spec = self.select_next_experiment(previous_records)
+            except Exception as exc:
+                # A planner that cannot produce a usable proposal must not end
+                # the run: fall back to the fixed schedule and keep going.
+                if self.llm_planner.config.force_code:
+                    raise
+                print(f"[planner] proposal failed ({type(exc).__name__}: {exc}); "
+                      f"falling back to the fixed schedule.")
+                next_spec = self._next_scheduled_spec(previous_records)
             if next_spec is None:
+                self.stop_reason = "schedule_exhausted"
                 break
             self.context.iteration_count += 1
             record = self._run_single_experiment(next_spec)
@@ -651,9 +791,21 @@ class BenchmarkController:
                     stagnation += 1
             if record.get("error"):
                 continue
+            # Convergence rule: N consecutive iterations without an
+            # epsilon-sized improvement over the incumbent.
             if stagnation >= self.patience:
+                self.stop_reason = "converged"
+                print(f"[convergence] {self.patience} iterations without a "
+                      f"+{self.epsilon} improvement; stopping.")
                 break
-        return {"best": self.context.best_metrics, "best_model": self.context.best_model_name, "iterations": previous_records}
+        return {
+            "best": self.context.best_metrics,
+            "best_model": self.context.best_model_name,
+            "iterations": previous_records,
+            "stop_reason": self.stop_reason,
+            "wall_clock_sec": time.time() - self.run_started_at,
+            "blocked": dict(self.blocked),
+        }
 
     def finalize_submission(self, submission_path: str = "submission.csv") -> str:
         target = self.context.best_model_name or "fm_baseline"
@@ -840,6 +992,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--patience", type=int, default=3)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--submission_path", default="submission.csv")
+    ap.add_argument(
+        "--wall_clock_hours", type=float, default=WALL_CLOCK_LIMIT_SEC / 3600.0,
+        help="Backstop wall-clock ceiling for the iteration loop (spec 2.3: 6h).",
+    )
     ap.add_argument(
         "--epochs", type=int, default=None,
         help="Optional cap applied to every registered experiment's epoch budget "
