@@ -10,8 +10,27 @@ import os
 import time
 from functools import wraps
 
+import numpy as np
+
 from agent_architecture import BenchmarkController, build_parser
 from llm_planner import load_dotenv
+
+
+def _json_safe(value):
+    """Convert common NumPy scalar/container values into JSON-safe objects."""
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    return value
 
 
 def _install_llm_telemetry(controller: BenchmarkController) -> None:
@@ -36,7 +55,7 @@ def _install_llm_telemetry(controller: BenchmarkController) -> None:
             "usage": usage,
         }
         with open(telemetry_path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            fh.write(json.dumps(_json_safe(record), ensure_ascii=False) + "\n")
         return proposal
 
     planner.suggest_next_experiment = wrapped
@@ -73,7 +92,7 @@ def main() -> None:
         "llm_enabled": controller.llm_planner.enabled,
     }
     with open(os.path.join(args.out_dir, "run_metadata.json"), "w", encoding="utf-8") as fh:
-        json.dump(metadata, fh, indent=2)
+        json.dump(_json_safe(metadata), fh, indent=2)
 
     print("\n=== autonomous research agent ===")
     print(f"best validation model: {result['best_model']}")
