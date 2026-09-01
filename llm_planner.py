@@ -49,7 +49,8 @@ class LLMPlannerConfig:
     api_version: Optional[str] = None
     deployment: Optional[str] = None
     temperature: float = 0.2
-    max_tokens: int = 300
+    max_tokens: int = 1200
+    force_code: bool = False
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
 
     @classmethod
@@ -60,9 +61,8 @@ class LLMPlannerConfig:
     def from_env(cls) -> "LLMPlannerConfig":
         api_key = os.getenv("KUAI_LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
         explicit_enabled = os.getenv("KUAI_LLM_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
-        # A local API key is enough to opt into the planner. Set KUAI_LLM_ENABLED=false
-        # only if you deliberately want to keep LLM planning disabled.
         enabled = explicit_enabled or bool(api_key)
+        force_code = os.getenv("KUAI_LLM_FORCE_CODE", "false").strip().lower() in {"1", "true", "yes", "on"}
         return cls(
             enabled=enabled,
             provider=os.getenv("KUAI_LLM_PROVIDER", "openai").strip() or "openai",
@@ -72,7 +72,8 @@ class LLMPlannerConfig:
             api_version=os.getenv("KUAI_LLM_API_VERSION") or None,
             deployment=os.getenv("KUAI_LLM_DEPLOYMENT") or None,
             temperature=float(os.getenv("KUAI_LLM_TEMPERATURE", "0.2")),
-            max_tokens=int(os.getenv("KUAI_LLM_MAX_TOKENS", "300")),
+            max_tokens=int(os.getenv("KUAI_LLM_MAX_TOKENS", "1200")),
+            force_code=force_code,
             system_prompt=os.getenv("KUAI_LLM_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT),
         )
 
@@ -108,6 +109,7 @@ def normalize_proposal(raw: Any) -> Dict[str, Any]:
     mode = str(proposal.get("mode") or "tune").strip().lower()
     code = str(proposal.get("code") or "")
     name = str(proposal.get("name") or proposal.get("experiment") or proposal.get("model") or "").strip()
+    if mode not in {"tune", "code"}: raise ValueError(f"unsupported proposal mode: {mode}")
     if mode != "code" and not name: raise ValueError("Proposal missing a valid name")
     if mode == "code" and not code.strip(): raise ValueError("mode='code' requires non-empty code")
     return {
@@ -152,6 +154,7 @@ class LLMPlanner:
         self.config = config or LLMPlannerConfig.from_env()
         self.last_error: Optional[str] = None
         self.last_usage: Dict[str, Any] = {}
+        self.last_proposal: Optional[Dict[str, Any]] = None
 
     @property
     def enabled(self) -> bool:
@@ -159,12 +162,20 @@ class LLMPlanner:
 
     def _build_payload(self, registry: Any, previous_records: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         names = list(getattr(registry, "_items", {}).keys())
+        if self.config.force_code:
+            task = (
+                "For this run, mode='code' is REQUIRED. Do not tune a registered experiment. "
+                "Write a complete, concise CandidateModel class satisfying the supplied interface contract. "
+                "Use the existing causal-history inputs if useful, but make a genuinely different architecture "
+                "from the registered HistoryDeepFM model. Return the class source in 'code' and a concise hypothesis."
+            )
+        else:
+            task = "Choose ONE move: tune a registered experiment or write a full CandidateModel. Return the required JSON."
         return {"model": self.config.model, "temperature": self.config.temperature, "max_tokens": self.config.max_tokens,
                 "messages": [
                     {"role": "system", "content": self.config.system_prompt},
                     {"role": "user", "content": json.dumps({"allowed_experiments_for_mode_tune": names,
-                        "history": summarize_for_prompt(previous_records),
-                        "task": "Choose ONE move: tune a registered experiment or write a full CandidateModel. Return the required JSON."}, ensure_ascii=False)}],
+                        "history": summarize_for_prompt(previous_records), "task": task}, ensure_ascii=False)}],
                 **({"response_format": {"type": "json_object"}} if self.config.provider.lower() != "azure" else {})}
 
     def _build_request(self) -> tuple[str, Dict[str, str]]:
@@ -199,10 +210,12 @@ class LLMPlanner:
 
     def suggest_next_experiment(self, registry: Any, previous_records: Iterable[Dict[str, Any]]) -> Optional[ProposedExperiment]:
         self.last_usage = {}
+        self.last_proposal = None
         if not self.enabled: return None
         try:
             response = self._call_provider(self._build_payload(registry, previous_records))
-            spec = resolve_experiment_spec(response, registry)
+            self.last_proposal = normalize_proposal(response)
+            spec = resolve_experiment_spec(self.last_proposal, registry)
             self.last_error = None
             return spec
         except Exception as exc:
