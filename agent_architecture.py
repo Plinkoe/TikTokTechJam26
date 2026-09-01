@@ -26,6 +26,7 @@ from data import load, encode
 from evaluate import evaluate
 from features import build_tabular_features
 from history_model import HistoryDeepFM, build_causal_features, load_history_rows, run_history_deepfm
+from llm_model_experiment import CandidateCodeError, compile_candidate_model, train_and_eval_candidate
 from models import NumpyNNModel
 from submit import write_submission, read_submission
 from llm_planner import LLMPlanner, LLMPlannerConfig, ProposedExperiment, load_dotenv
@@ -243,6 +244,82 @@ class MultitaskDeepFMExperiment(HistoryDeepFMExperiment):
         return params
 
 
+class LLMCodeExperiment(BaseExperiment):
+    """Trains whatever `CandidateModel` architecture the LLM planner wrote for
+    this iteration -- not a pre-built class from this file. Feature
+    engineering, the training loop, and the eval protocol are fixed and
+    shared (see llm_model_experiment.py); only the model architecture itself
+    is generated, sandboxed, and dry-run-validated before real training.
+
+    One registry entry serves every iteration: the controller gives each
+    proposal its own record name (llm_generated_<n>) so several distinct
+    architectures can be tried across a run, but they all route through this
+    same experiment object with a different params["code"] each time.
+    """
+    name = "llm_generated"
+    family = "llm_code"
+
+    def default_params(self) -> Dict[str, Any]:
+        return {
+            "epochs": 6, "lr": 1e-3, "emb_dim": 12, "hidden": 96,
+            "dropout": 0.1, "weight_decay": 1e-6, "seed": 0,
+            "history_len": 0, "batch_size": 8192, "patience": 3,
+            "code": "",
+        }
+
+    def run(self, context: "BenchmarkContext", params: Optional[Dict[str, Any]] = None):
+        p = self.default_params(); p.update(params or {})
+        code = (p.pop("code", "") or "").strip()
+        if not code:
+            raise CandidateCodeError("llm_generated experiment requires a non-empty params['code']")
+        model_cls = compile_candidate_model(code)
+        return train_and_eval_candidate(model_cls, context.data_dir, hyperparams=p)
+
+    def finalize(self, context: "BenchmarkContext", params: Optional[Dict[str, Any]] = None):
+        p = self.default_params(); p.update(params or {})
+        code = (p.pop("code", "") or "").strip()
+        if not code:
+            raise CandidateCodeError("llm_generated experiment requires params['code'] to finalize")
+        model_cls = compile_candidate_model(code)
+
+        rows = load_history_rows(context.data_dir)
+        train = rows["train"] + rows["valid"]
+        test_rows = _read_test_rows(context.data_dir)
+        if not test_rows:
+            raise RuntimeError("No test rows available in data_dir; cannot finalize submission.")
+        split = {"train": train, "valid": test_rows}
+        (tr_cat, tr_dense, tr_hist, tr_y, *_), (va_cat, va_dense, va_hist, va_y, *_, va_users), \
+            vocab_sizes, _ = build_causal_features(split, history_len=p.get("history_len", 0))
+
+        tr_cat = torch.from_numpy(np.asarray(tr_cat, dtype=np.int64))
+        tr_dense = torch.from_numpy(np.asarray(tr_dense, dtype=np.float32))
+        tr_y = torch.from_numpy(np.asarray(tr_y, dtype=np.float32))
+        va_cat = torch.from_numpy(np.asarray(va_cat, dtype=np.int64))
+        va_dense = torch.from_numpy(np.asarray(va_dense, dtype=np.float32))
+        tr_hist = torch.from_numpy(np.asarray(tr_hist, dtype=np.int32)) if tr_hist is not None else None
+        va_hist = torch.from_numpy(np.asarray(va_hist, dtype=np.int32)) if va_hist is not None else None
+
+        model = model_cls(vocab_sizes, tr_dense.shape[1], emb_dim=p["emb_dim"],
+                           hidden=p["hidden"], dropout=p["dropout"])
+        optimizer = torch.optim.AdamW(model.parameters(), lr=p["lr"], weight_decay=p.get("weight_decay", 1e-6))
+        rng = np.random.default_rng(p["seed"])
+        for _ in range(p["epochs"]):
+            model.train()
+            order = rng.permutation(len(tr_y))
+            for start in range(0, len(order), p["batch_size"]):
+                idx = torch.from_numpy(order[start:start + p["batch_size"]])
+                h = tr_hist[idx] if tr_hist is not None else None
+                optimizer.zero_grad()
+                logits = model(tr_cat[idx], tr_dense[idx], h)
+                loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, tr_y[idx])
+                loss.backward()
+                optimizer.step()
+        model.eval()
+        with torch.no_grad():
+            scores = model(va_cat, va_dense, va_hist).sigmoid().numpy()
+        return scores
+
+
 class TabularExperiment(BaseExperiment):
     name = "tabular_model"
     family = "tabular"
@@ -382,13 +459,28 @@ class BenchmarkController:
         self.splits = load(data_dir)
         self.logger = RunLogger(out_dir)
         self.registry = ExperimentRegistry()
-        for model in [FMExperiment(), HistoryDeepFMExperiment(), MultitaskDeepFMExperiment(), TabularExperiment(), BlendExperiment()]:
+        for model in [FMExperiment(), HistoryDeepFMExperiment(), MultitaskDeepFMExperiment(), TabularExperiment(), BlendExperiment(), LLMCodeExperiment()]:
             self.registry.register(model)
         self.context = BenchmarkContext(data_dir=data_dir, out_dir=out_dir, splits=self.splits, seed=seed, max_iters=max_iters, epsilon=epsilon, patience=patience)
         self.schedule = self.registry.default_schedule()
         self.tried = set()
         self.best_primary = -1.0
         self.llm_planner = LLMPlanner(llm_config or LLMPlannerConfig.from_env())
+
+    def _resolve_experiment(self, name: str) -> BaseExperiment:
+        """Look up an experiment by record name.
+
+        Pre-built experiments (fm_baseline, history_deepfm, ...) are keyed by
+        their own name. LLM-authored architectures get a fresh record name
+        per iteration (llm_generated_0, llm_generated_1, ...) so several
+        distinct candidates can appear in the same run's logs, but they all
+        route through the single registered `llm_generated` experiment object.
+        """
+        if name in self.registry._items:
+            return self.registry.get(name)
+        if name.startswith("llm_generated"):
+            return self.registry.get("llm_generated")
+        raise KeyError(name)
 
     def _maybe_llm_next_spec(self, previous_records: Iterable[Dict[str, Any]]) -> Optional[ExperimentSpec]:
         if not self.llm_planner.enabled:
@@ -397,6 +489,23 @@ class BenchmarkController:
         proposal = self.llm_planner.suggest_next_experiment(self.registry, previous_records)
         if proposal is None:
             return None
+
+        # Code-mode: the LLM wrote a new CandidateModel architecture rather
+        # than picking params for an existing pre-built experiment. Each such
+        # proposal gets its own record name so it always runs (no dedup
+        # against a fixed registry name) and shows up as its own line in
+        # iterations.jsonl/results, distinct from earlier candidates.
+        code = (getattr(proposal, "code", "") or "").strip()
+        if proposal.family == "llm_code" or code:
+            if not code:
+                return None
+            return ExperimentSpec(
+                name=f"llm_generated_{len(list(previous_records))}",
+                family="llm_code",
+                params={**dict(proposal.params), "code": code},
+                hypothesis=proposal.hypothesis,
+                code_diff=code,
+            )
 
         if proposal.name not in self.registry._items:
             return None
@@ -472,7 +581,7 @@ class BenchmarkController:
         return None
 
     def _run_single_experiment(self, spec: ExperimentSpec, retries: int = 2) -> Dict[str, Any]:
-        experiment = self.registry.get(spec.name)
+        experiment = self._resolve_experiment(spec.name)
         params = dict(spec.params)
         params["data_dir"] = self.data_dir
         for attempt in range(retries + 1):
@@ -548,10 +657,21 @@ class BenchmarkController:
 
     def finalize_submission(self, submission_path: str = "submission.csv") -> str:
         target = self.context.best_model_name or "fm_baseline"
-        for candidate in [target, "fm_baseline"]:
+        # NOTE: this used to call experiment.finalize(context, experiment.default_params()),
+        # silently ignoring whatever params actually won during the loop (tuned
+        # dropout, an llm_generated candidate's code, ...) and retraining the
+        # experiment's *default* config instead. That bug is why the published
+        # test numbers only matched the real champion when finalize_and_score.py
+        # was run by hand with the winning config re-supplied manually -- the
+        # automated agent.py path never reproduced it. Use the winning record's
+        # actual params here, layered over the experiment's defaults.
+        best_params = dict((self.context.best_record or {}).get("params") or {})
+        for candidate, candidate_params in [(target, best_params), ("fm_baseline", {})]:
             try:
-                experiment = self.registry.get(candidate)
-                scores = experiment.finalize(self.context, experiment.default_params())
+                experiment = self._resolve_experiment(candidate)
+                merged_params = dict(experiment.default_params())
+                merged_params.update(candidate_params)
+                scores = experiment.finalize(self.context, merged_params)
                 full_path = os.path.join(self.out_dir, submission_path)
                 write_submission(full_path, self.splits["test"], scores)
                 read_submission(full_path, self.splits["test"])

@@ -31,13 +31,25 @@ def load_dotenv(path: Optional[str] = None) -> bool:
     return loaded
 
 
+from llm_model_experiment import MODEL_INTERFACE_CONTRACT
+
 DEFAULT_SYSTEM_PROMPT = (
     "You are a disciplined ML research assistant for the KuaiRand benchmark. "
-    "Your job is to choose the next experiment from the allowed experiment registry. "
-    "The history contains past validation metrics; ignore hidden test data. "
-    "Prefer an experiment that addresses a likely weakness, keeps training cheap, "
-    "and is consistent with the benchmark's goal of improving validation primary score. "
-    "Return only valid JSON with a top-level 'proposal' object."
+    "Each turn you choose ONE of two moves:\n"
+    "  (a) mode='tune' -- pick an existing registered experiment by name and give it new params.\n"
+    "  (b) mode='code' -- write a brand-new model architecture from scratch as Python source, "
+    "when you believe the registered architectures have plateaued or you have a specific "
+    "structural hypothesis (a different interaction pattern, a different way of pooling "
+    "history, a different capacity/regularization trade-off, etc). This is not a param "
+    "sweep -- it's you writing the forward pass yourself.\n\n"
+    "The interface contract for mode='code' is:\n" + MODEL_INTERFACE_CONTRACT + "\n"
+    "The history contains past validation metrics AND, for any candidate that failed, the "
+    "error message it failed with -- if you see an error attached to a previous llm_generated "
+    "attempt, your next mode='code' proposal should fix that specific problem, not repeat it. "
+    "Ignore hidden test data entirely; you only ever see validation metrics. "
+    "Return only valid JSON with a top-level 'proposal' object: "
+    "{'mode': 'tune'|'code', 'name': ..., 'family': ..., 'params': {...}, 'code': '...', "
+    "'hypothesis': '...'}. Omit 'code' entirely for mode='tune'; omit 'name' for mode='code'."
 )
 
 
@@ -83,6 +95,8 @@ class ProposedExperiment:
     params: Dict[str, Any] = field(default_factory=dict)
     hypothesis: str = ""
     code_diff: str = ""
+    mode: str = "tune"
+    code: str = ""
 
 
 def _coerce_mapping(value: Any) -> Dict[str, Any]:
@@ -114,21 +128,28 @@ def normalize_proposal(raw: Any) -> Dict[str, Any]:
     if not isinstance(proposal, dict):
         raise ValueError("Proposal payload must decode to a dictionary")
 
+    mode = str(proposal.get("mode") or "tune").strip().lower()
+    code = str(proposal.get("code") or "")
+
     name = str(proposal.get("name") or proposal.get("experiment") or proposal.get("model") or "").strip()
-    if not name:
-        raise ValueError("Proposal missing a valid 'name' or 'experiment' field")
+    if mode != "code" and not name:
+        raise ValueError("Proposal missing a valid 'name' or 'experiment' field (required unless mode='code')")
+    if mode == "code" and not code.strip():
+        raise ValueError("Proposal has mode='code' but no non-empty 'code' field")
 
     params = _coerce_mapping(proposal.get("params") or proposal.get("arguments") or {})
     hypothesis = str(proposal.get("hypothesis") or proposal.get("reason") or "")
     code_diff = str(proposal.get("code_diff") or proposal.get("changes") or "")
-    family = str(proposal.get("family") or proposal.get("family_name") or "generic")
+    family = str(proposal.get("family") or proposal.get("family_name") or ("llm_code" if mode == "code" else "generic"))
 
     return {
-        "name": name,
+        "name": name or "llm_generated",
         "family": family,
         "params": params,
         "hypothesis": hypothesis,
         "code_diff": code_diff,
+        "mode": mode,
+        "code": code,
     }
 
 
@@ -137,7 +158,7 @@ def resolve_experiment_spec(raw_proposal: Any, registry: Optional[Any] = None) -
     name = proposal["name"]
     family = proposal["family"]
 
-    if registry is not None:
+    if registry is not None and proposal.get("mode") != "code":
         names = getattr(registry, "_items", {})
         if name in names:
             family = names[name].family
@@ -148,6 +169,8 @@ def resolve_experiment_spec(raw_proposal: Any, registry: Optional[Any] = None) -
         params=dict(proposal.get("params") or {}),
         hypothesis=str(proposal.get("hypothesis") or ""),
         code_diff=str(proposal.get("code_diff") or ""),
+        mode=str(proposal.get("mode") or "tune"),
+        code=str(proposal.get("code") or ""),
     )
 
 
@@ -156,15 +179,25 @@ def _summarize_history(previous_records: Iterable[Dict[str, Any]]) -> str:
     for record in previous_records:
         metrics = record.get("metrics") or {}
         valid = metrics.get("valid") or {}
-        rows.append({
+        error = record.get("error")
+        row = {
             "experiment": record.get("experiment"),
             "family": record.get("family"),
             "primary": valid.get("primary"),
             "gauc": valid.get("gauc"),
             "ndcg": valid.get("ndcg@5") if "ndcg@5" in valid else valid.get("ndcg"),
             "status": record.get("status"),
-            "error": record.get("error"),
-        })
+        }
+        if error:
+            # Only the last line of the traceback -- enough to tell the LLM
+            # *what* broke (a shape mismatch, a disallowed token, a crash on
+            # history=None) without spending its context on the full stack.
+            row["error"] = str(error).strip().splitlines()[-1][:300]
+        if record.get("family") == "llm_code" and record.get("code_diff"):
+            # Let the LLM see roughly what it already tried architecturally,
+            # not just the score, so it doesn't re-propose the same structure.
+            row["previous_code_snippet"] = record["code_diff"][:400]
+        rows.append(row)
     return json.dumps(rows[-10:], ensure_ascii=False)
 
 
@@ -197,9 +230,15 @@ class LLMPlanner:
             "messages": [
                 {"role": "system", "content": self.config.system_prompt},
                 {"role": "user", "content": json.dumps({
-                    "allowed_experiments": names,
+                    "allowed_experiments_for_mode_tune": names,
                     "history": history,
-                    "task": "Choose only one new experiment to run next. Return JSON with a top-level 'proposal' object containing name, family, params, hypothesis, and code_diff. Keep params within the registered experiment defaults and avoid unsupported values.",
+                    "task": (
+                        "Choose ONE move for the next iteration. Either mode='tune' "
+                        "(name must be one of allowed_experiments_for_mode_tune, plus params) "
+                        "or mode='code' (write a full CandidateModel class per the interface "
+                        "contract in the system prompt, put its source in 'code'). "
+                        "Return JSON: {'proposal': {'mode', 'name', 'family', 'params', 'code', 'hypothesis'}}."
+                    ),
                 }, ensure_ascii=False)}
             ],
         }
