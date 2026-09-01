@@ -160,17 +160,15 @@ class LLMPlanner:
     def enabled(self) -> bool:
         return bool(self.config.enabled and (self.config.api_key or self.config.base_url))
 
-    def _build_payload(self, registry: Any, previous_records: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    def _build_payload(self, registry: Any, previous_records: Iterable[Dict[str, Any]], force_code_attempt: bool = False) -> Dict[str, Any]:
         names = list(getattr(registry, "_items", {}).keys())
-        if self.config.force_code:
-            task = (
-                "For this run, mode='code' is REQUIRED. Do not tune a registered experiment. "
-                "Write a complete, concise CandidateModel class satisfying the supplied interface contract. "
-                "Use the existing causal-history inputs if useful, but make a genuinely different architecture "
-                "from the registered HistoryDeepFM model. Return the class source in 'code' and a concise hypothesis."
-            )
-        else:
-            task = "Choose ONE move: tune a registered experiment or write a full CandidateModel. Return the required JSON."
+        task = (
+            "You MUST choose mode='code' for this request. Do not return mode='tune'. "
+            "Write a complete CandidateModel class satisfying the supplied interface contract. "
+            "The class must be meaningfully different from the registered architectures."
+            if force_code_attempt else
+            "Choose ONE move: tune a registered experiment or write a full CandidateModel. Return the required JSON."
+        )
         return {"model": self.config.model, "temperature": self.config.temperature, "max_tokens": self.config.max_tokens,
                 "messages": [
                     {"role": "system", "content": self.config.system_prompt},
@@ -211,13 +209,24 @@ class LLMPlanner:
     def suggest_next_experiment(self, registry: Any, previous_records: Iterable[Dict[str, Any]]) -> Optional[ProposedExperiment]:
         self.last_usage = {}
         self.last_proposal = None
+        self.last_error = None
         if not self.enabled: return None
-        try:
-            response = self._call_provider(self._build_payload(registry, previous_records))
-            self.last_proposal = normalize_proposal(response)
-            spec = resolve_experiment_spec(self.last_proposal, registry)
-            self.last_error = None
-            return spec
-        except Exception as exc:
-            self.last_error = str(exc)
-            return None
+
+        previous = list(previous_records)
+        attempts = 3 if self.config.force_code else 1
+        for attempt in range(attempts):
+            try:
+                response = self._call_provider(self._build_payload(registry, previous, force_code_attempt=self.config.force_code))
+                normalized = normalize_proposal(response)
+                self.last_proposal = normalized
+                if self.config.force_code and normalized["mode"] != "code":
+                    self.last_error = "LLM returned mode='tune' while KUAI_LLM_FORCE_CODE=true"
+                    continue
+                spec = resolve_experiment_spec(normalized, registry)
+                return spec
+            except Exception as exc:
+                self.last_error = str(exc)
+                if not self.config.force_code:
+                    return None
+
+        return None
