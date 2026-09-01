@@ -58,8 +58,11 @@ class LLMPlannerConfig:
 
     @classmethod
     def from_env(cls) -> "LLMPlannerConfig":
-        enabled = os.getenv("KUAI_LLM_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
         api_key = os.getenv("KUAI_LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+        explicit_enabled = os.getenv("KUAI_LLM_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+        # A local API key is enough to opt into the planner. Set KUAI_LLM_ENABLED=false
+        # only if you deliberately want to keep LLM planning disabled.
+        enabled = explicit_enabled or bool(api_key)
         return cls(
             enabled=enabled,
             provider=os.getenv("KUAI_LLM_PROVIDER", "openai").strip() or "openai",
